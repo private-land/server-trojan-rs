@@ -6,10 +6,12 @@ use crate::core::hooks::{Authenticator, StatsCollector};
 use crate::core::UserId;
 
 // Re-export panel types used by main.rs
+pub use panel_connect_rpc::{
+    ConnectRpcApiManager as ApiManager, ConnectRpcPanelConfig as PanelConfig,
+};
 pub use panel_core::{
     BackgroundTasks, StatsCollector as PanelStatsCollector, TaskConfig, UserManager,
 };
-pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig};
 
 /// Newtype bridging panel::StatsCollector to core::hooks::StatsCollector trait
 pub struct TrojanStatsCollector(pub Arc<PanelStatsCollector>);

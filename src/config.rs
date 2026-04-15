@@ -35,17 +35,25 @@ const DEFAULT_DATA_DIR: &str = "/var/lib/trojan-node";
 #[command(author, version, about = "Trojan Server with Remote Panel Integration")]
 #[command(rename_all = "snake_case")]
 pub struct CliArgs {
-    /// API endpoint URL (required)
-    #[arg(long, env = "X_PANDA_TROJAN_API")]
-    pub api: String,
+    /// Panel server host (e.g., "127.0.0.1")
+    #[arg(long, env = "X_PANDA_TROJAN_SERVER_HOST", default_value = "127.0.0.1")]
+    pub server_host: String,
 
-    /// API authentication token (required)
-    #[arg(long, env = "X_PANDA_TROJAN_TOKEN")]
-    pub token: String,
+    /// Panel server port (e.g., 8082)
+    #[arg(long, env = "X_PANDA_TROJAN_PORT", default_value_t = 8082)]
+    pub port: u16,
 
     /// Node ID from the panel (required)
     #[arg(long, env = "X_PANDA_TROJAN_NODE")]
-    pub node: i64,
+    pub node: u32,
+
+    /// TLS server name (SNI) for panel connection (defaults to --server-host)
+    #[arg(long, env = "X_PANDA_TROJAN_SERVER_NAME")]
+    pub server_name: Option<String>,
+
+    /// CA certificate path for panel TLS (omit for system trust store)
+    #[arg(long, env = "X_PANDA_TROJAN_CA_FILE")]
+    pub ca_file: Option<String>,
 
     /// TLS certificate file path (default: /root/.cert/server.crt)
     #[arg(
@@ -75,9 +83,9 @@ pub struct CliArgs {
     #[arg(long, env = "X_PANDA_TROJAN_HEARTBEAT_INTERVAL", default_value = "180s", value_parser = parse_duration)]
     pub heartbeat_interval: Duration,
 
-    /// API request timeout (e.g., "30s", "1m", default: 30s)
-    #[arg(long, env = "X_PANDA_TROJAN_API_TIMEOUT", default_value = "30s", value_parser = parse_duration)]
-    pub api_timeout: Duration,
+    /// Panel request timeout in seconds (default: 15)
+    #[arg(long, env = "X_PANDA_TROJAN_TIMEOUT", default_value_t = 15)]
+    pub timeout: u64,
 
     /// Log mode: debug, info, warn, error (default: info)
     #[arg(long, env = "X_PANDA_TROJAN_LOG_MODE", default_value = "info")]
@@ -173,13 +181,10 @@ impl CliArgs {
 
     /// Validate the CLI arguments
     pub fn validate(&self) -> Result<()> {
-        if self.api.is_empty() {
-            return Err(anyhow!("API endpoint URL is required"));
+        if self.server_host.is_empty() {
+            return Err(anyhow!("Server host is required"));
         }
-        if self.token.is_empty() {
-            return Err(anyhow!("API token is required"));
-        }
-        if self.node <= 0 {
+        if self.node == 0 {
             return Err(anyhow!("Node ID must be a positive integer"));
         }
 
@@ -428,15 +433,17 @@ mod tests {
 
     fn create_test_cli_args() -> CliArgs {
         CliArgs {
-            api: "https://api.example.com".to_string(),
-            token: "test-token".to_string(),
+            server_host: "127.0.0.1".to_string(),
+            port: 8082,
             node: 1,
+            server_name: None,
+            ca_file: None,
             cert_file: "/path/to/cert.pem".to_string(),
             key_file: "/path/to/key.pem".to_string(),
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(80),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(30),
+            timeout: 15,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
@@ -465,15 +472,17 @@ mod tests {
         std::fs::write(&key_path, "dummy key").unwrap();
 
         let cli = CliArgs {
-            api: "https://api.example.com".to_string(),
-            token: "test-token".to_string(),
+            server_host: "127.0.0.1".to_string(),
+            port: 8082,
             node: 1,
+            server_name: None,
+            ca_file: None,
             cert_file: cert_path.to_string_lossy().to_string(),
             key_file: key_path.to_string_lossy().to_string(),
             fetch_users_interval: Duration::from_secs(60),
             report_traffics_interval: Duration::from_secs(80),
             heartbeat_interval: Duration::from_secs(180),
-            api_timeout: Duration::from_secs(30),
+            timeout: 15,
             log_mode: "info".to_string(),
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             acl_conf_file: None,
@@ -509,16 +518,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_args_validate_empty_api() {
+    fn test_cli_args_validate_empty_server_host() {
         let mut cli = create_test_cli_args();
-        cli.api = "".to_string();
-        assert!(cli.validate().is_err());
-    }
-
-    #[test]
-    fn test_cli_args_validate_empty_token() {
-        let mut cli = create_test_cli_args();
-        cli.token = "".to_string();
+        cli.server_host = "".to_string();
         assert!(cli.validate().is_err());
     }
 
@@ -526,9 +528,6 @@ mod tests {
     fn test_cli_args_validate_invalid_node_id() {
         let mut cli = create_test_cli_args();
         cli.node = 0;
-        assert!(cli.validate().is_err());
-
-        cli.node = -1;
         assert!(cli.validate().is_err());
     }
 

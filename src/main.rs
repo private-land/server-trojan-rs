@@ -52,28 +52,36 @@ async fn main() -> Result<()> {
     // Initialize logger
     logger::init_logger(&cli.log_mode);
 
+    let panel_server_name = cli
+        .server_name
+        .clone()
+        .unwrap_or_else(|| cli.server_host.clone());
+
     log::info!(
-        api = %cli.api,
+        server_host = %cli.server_host,
+        port = cli.port,
         node = cli.node,
+        server_name = %panel_server_name,
         "Starting Trojan server with layered architecture"
     );
 
     // Create connection manager (shared between core and business layers)
     let conn_manager = ConnectionManager::new();
 
-    // Create panel config
+    // Create panel config (connect-rpc via QUIC/H3)
     let panel_config = PanelConfig {
-        api: cli.api.clone(),
-        token: cli.token.clone(),
+        server_host: cli.server_host.clone(),
+        server_port: cli.port,
         node_id: cli.node,
         node_type: panel_core::NodeType::Trojan,
-        state_file_path: cli.data_dir.join(format!("node-{}.state", cli.node)),
-        api_timeout: cli.api_timeout.as_secs(),
-        debug: cli.log_mode == "debug",
+        data_dir: cli.data_dir.clone(),
+        api_timeout: std::time::Duration::from_secs(cli.timeout),
+        server_name: panel_server_name,
+        ca_cert_path: cli.ca_file.clone(),
     };
 
     // Create API manager
-    let api_manager = Arc::new(ApiManager::new(panel_config)?);
+    let api_manager = Arc::new(ApiManager::new(panel_config));
 
     // Create user manager
     let user_manager = Arc::new(UserManager::new());
