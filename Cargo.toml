@@ -1,6 +1,6 @@
 [package]
 name = "server-trojan-rs"
-version = "0.2.33"
+version = "0.2.34"
 edition = "2021"
 
 [dependencies]
@@ -39,8 +39,8 @@ acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1" }
 
 # Panel Integration
-panel-core = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.19" }
-panel-http = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.19" }
+panel-core = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.20" }
+panel-http = { git = "https://github.com/private-land/server-panel-rs.git", tag = "v0.1.20" }
 socket2 = "0.6"
 
 [[bin]]
