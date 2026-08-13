@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| cli.server_host.clone()),
         ca_cert_path: cli.ca_file.clone(),
         ip_version: cli.panel_ip_version,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
 
     // Create API manager (connect-rpc via QUIC/H3)
