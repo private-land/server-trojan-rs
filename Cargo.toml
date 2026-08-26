@@ -1,6 +1,6 @@
 [package]
 name = "server-trojan-rs"
-version = "0.2.34"
+version = "0.2.35"
 edition = "2021"
 
 [dependencies]
@@ -33,7 +33,7 @@ async-trait = "0.1"
 arc-swap = "1"
 
 # ACL Engine (remote)
-acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.5", features = ["async"] }
+acl-engine-rs = { git = "https://github.com/private-land/acl-engine-rs.git", tag = "v0.4.6", features = ["async"] }
 
 # DNS resolution cache (internal library, shared with server-anytls/server-mieru)
 dns-cache-rs = { git = "https://github.com/private-land/dns-cache-rs.git", tag = "v0.2.1" }
