@@ -36,10 +36,10 @@ use serde::{Deserialize, Serialize};
 
 // Re-export types from acl-engine-rs
 pub use acl_engine_rs::{
-    geo::{AutoGeoLoader, GeoIpFormat, GeoSiteFormat, NilGeoLoader},
+    geo::{AutoGeoLoader, GeoIpFormat, GeoSiteFormat},
     outbound::{
         Addr, AsyncOutbound, AsyncTcpConn, AsyncUdpConn, Direct, DirectMode, DirectOptions, Http,
-        Reject, Socks5,
+        Reject, ResolveInfo, Socks5,
     },
     HostInfo, Protocol,
 };
@@ -424,13 +424,12 @@ impl OutboundHandler {
     }
 
     /// Check if this handler rejects connections
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_reject(&self) -> bool {
         matches!(self, OutboundHandler::Reject(_))
     }
 
     /// Check if this handler allows UDP
-    #[allow(dead_code)]
     pub fn allows_udp(&self) -> bool {
         match self {
             OutboundHandler::Direct(_) => true,
@@ -466,8 +465,7 @@ impl AsyncOutbound for OutboundHandler {
 pub struct AclEngine {
     /// Compiled rule set
     compiled: acl_engine_rs::CompiledRuleSet<Arc<OutboundHandler>>,
-    /// Keep outbounds map for reference
-    #[allow(dead_code)]
+    /// Outbounds by name; `direct` is the fallback for unmatched hosts
     outbounds: HashMap<String, Arc<OutboundHandler>>,
 }
 
@@ -557,7 +555,7 @@ impl AclEngine {
     }
 
     /// Create a default ACL engine (direct all traffic)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new_default() -> Result<Self> {
         let mut outbounds: HashMap<String, Arc<OutboundHandler>> = HashMap::new();
         outbounds.insert(
@@ -576,7 +574,7 @@ impl AclEngine {
             &text_rules,
             &outbounds,
             NonZeroUsize::new(1024).unwrap(),
-            &NilGeoLoader,
+            &acl_engine_rs::geo::NilGeoLoader,
         )
         .map_err(|e| anyhow!("Failed to compile default rules: {}", e))?;
 
@@ -587,12 +585,25 @@ impl AclEngine {
     }
 
     /// Match a host against ACL rules and return the appropriate outbound handler
+    #[cfg(test)]
     pub fn match_host(
         &self,
         host: &str,
         port: u16,
         protocol: Protocol,
     ) -> Option<Arc<OutboundHandler>> {
+        self.match_host_hijack(host, port, protocol).map(|(h, _)| h)
+    }
+
+    /// Like `match_host`, also returning the rule's hijack address
+    /// (`outbound(match, proto/port, hijackAddress)`), which replaces the
+    /// destination the client asked for.
+    pub fn match_host_hijack(
+        &self,
+        host: &str,
+        port: u16,
+        protocol: Protocol,
+    ) -> Option<(Arc<OutboundHandler>, Option<std::net::IpAddr>)> {
         // Create HostInfo from host string
         let host_info = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             HostInfo::from_ip(ip)
@@ -601,10 +612,10 @@ impl AclEngine {
         };
 
         match self.compiled.match_host(&host_info, protocol, port) {
-            Some(result) => Some(result.outbound.clone()),
+            Some(result) => Some((result.outbound.clone(), result.hijack_ip)),
             None => {
                 // No match, return default direct
-                self.outbounds.get("direct").cloned()
+                self.outbounds.get("direct").cloned().map(|h| (h, None))
             }
         }
     }
@@ -658,57 +669,178 @@ impl AclRouter {
 #[async_trait]
 impl crate::core::hooks::OutboundRouter for AclRouter {
     async fn route(&self, addr: &crate::core::Address) -> crate::core::hooks::OutboundType {
-        let mut resolved_addr: Option<std::net::SocketAddr> = None;
+        self.route_with_protocol(addr, Protocol::TCP).await
+    }
 
-        // Check for private IP if blocking is enabled
-        if self.block_private_ip {
-            let (is_private, resolved) =
-                crate::core::dns::check_private_and_resolve(&self.dns_cache, addr).await;
-            if is_private {
-                log::debug!(target = %addr, "Blocked private address");
-                return crate::core::hooks::OutboundType::Reject;
-            }
-            resolved_addr = resolved;
-        }
-
-        // Extract host and port for ACL matching (Cow avoids alloc for domains)
-        let host = addr.host();
-        let port = addr.port();
-
-        self.route_host_with_resolved(&host, port, resolved_addr)
+    async fn route_udp(&self, addr: &crate::core::Address) -> crate::core::hooks::OutboundType {
+        self.route_with_protocol(addr, Protocol::UDP).await
     }
 }
 
 impl AclRouter {
-    /// Route host via ACL engine, passing through any pre-resolved address for Direct results.
-    fn route_host_with_resolved(
+    /// Match the ACL first, then resolve only what a direct outbound needs.
+    ///
+    /// Resolving before matching would leak DNS for domains the rules send
+    /// through a proxy, waste a lookup whose result is discarded, and reject a
+    /// domain that happens to resolve privately *here* even when the rule
+    /// says to proxy it. IP literals need no lookup, so under
+    /// `block_private_ip` a private literal is rejected whatever the rule
+    /// says, including proxy rules (a local SOCKS5/HTTP outbound would
+    /// otherwise reach this host's loopback/LAN/metadata addresses).
+    async fn route_with_protocol(
         &self,
-        host: &str,
-        port: u16,
-        resolved: Option<std::net::SocketAddr>,
+        addr: &crate::core::Address,
+        protocol: Protocol,
     ) -> crate::core::hooks::OutboundType {
-        match self.engine.match_host(host, port, Protocol::TCP) {
-            Some(handler) => match &*handler {
-                OutboundHandler::Direct(_) => crate::core::hooks::OutboundType::Direct {
-                    resolved,
-                    handler: Some(handler),
-                },
+        use crate::core::dns::{screen_direct_target, DirectTarget, ResolvedAddrs};
+        use crate::core::hooks::OutboundType;
+
+        // Match first: a proxied domain is never resolved here (no DNS leak);
+        // everything that goes out directly is screened below.
+        let host = addr.host();
+        let port = addr.port();
+        let matched = self.engine.match_host_hijack(&host, port, protocol);
+        if let Some((h, hijack)) = &matched {
+            match h.as_ref() {
+                OutboundHandler::Reject(_) => return OutboundType::Reject,
                 OutboundHandler::Socks5 { .. } | OutboundHandler::Http(_) => {
-                    crate::core::hooks::OutboundType::Proxy(handler)
+                    // Private literals never leave, through any outbound
+                    // (no lookup needed; the direct path screens below).
+                    if self.block_private_ip {
+                        if let Some(ip) = addr.literal_ip() {
+                            if crate::core::ip_filter::is_private_ip(&ip) {
+                                log::debug!(target = %addr, "Blocked private address");
+                                return OutboundType::Reject;
+                            }
+                        } else if is_numeric_host(&host) || is_localhost_name(&host) {
+                            // "2130706433", "127.1", "0x7f000001" (inet_aton),
+                            // "localhost"/"*.localhost" (RFC 6761) and the
+                            // /etc/hosts loopback aliases: not real hostnames,
+                            // but the proxy host resolves them to loopback.
+                            log::debug!(target = %addr, "Blocked loopback-resolving host on proxy outbound");
+                            return OutboundType::Reject;
+                        }
+                    }
+                    return OutboundType::Proxy {
+                        handler: Arc::clone(h),
+                        hijack: *hijack,
+                    };
                 }
-                OutboundHandler::Reject(_) => crate::core::hooks::OutboundType::Reject,
-            },
-            None => crate::core::hooks::OutboundType::Direct {
-                resolved,
-                handler: None,
-            },
+                OutboundHandler::Direct(_) => {}
+            }
+        }
+        // `None` only when no `direct` outbound exists (AclEngine::new always
+        // adds one): plain direct without options.
+        let (handler, hijack) = match matched {
+            Some((h, hijack)) => (Some(h), hijack),
+            None => (None, None),
+        };
+
+        // Hijacked destination: connect to the rule's address. It comes from
+        // the operator's ACL file, not the client, so `block_private_ip` does
+        // not apply — `direct(all, udp/53, 127.0.0.1)` (DNS to a local
+        // resolver) is the canonical use.
+        if let Some(ip) = hijack {
+            return OutboundType::Direct {
+                resolved: ResolvedAddrs::collect(port, [ip]),
+                handler,
+            };
+        }
+
+        // Direct outbound: same screening/resolution policy as DirectRouter.
+        match screen_direct_target(&self.dns_cache, addr, self.block_private_ip).await {
+            DirectTarget::Blocked => OutboundType::Reject,
+            DirectTarget::Allow(resolved) => OutboundType::Direct { resolved, handler },
         }
     }
+}
+
+/// A host that is not an IP literal yet could be read as one by
+/// inet_aton-style resolvers: numeric (or `0x` hex) last label. No real
+/// hostname has a numeric top-level label.
+fn is_numeric_host(host: &str) -> bool {
+    let last = host.trim_end_matches('.').rsplit('.').next().unwrap_or("");
+    !last.is_empty()
+        && (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .or_else(|| last.strip_prefix("0X"))
+                .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
+/// Names that resolve to loopback everywhere: `localhost` and anything under
+/// it (RFC 6761) plus the aliases stock `/etc/hosts` files carry.
+fn is_localhost_name(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        h.as_str(),
+        "localhost"
+            | "localhost4"
+            | "localhost6"
+            | "localhost.localdomain"
+            | "localhost4.localdomain4"
+            | "localhost6.localdomain6"
+            | "ip6-localhost"
+            | "ip6-loopback"
+    ) || h.ends_with(".localhost")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn localhost_names_are_detected() {
+        for h in [
+            "localhost",
+            "LOCALHOST.",
+            "foo.localhost",
+            "a.b.LocalHost",
+            "localhost.localdomain",
+            "ip6-localhost",
+            "ip6-loopback",
+            "localhost6",
+            "\u{e9}abcdefghi",
+        ] {
+            let _ = is_localhost_name(h); // must not panic on non-ASCII
+        }
+        for h in [
+            "localhost",
+            "LOCALHOST.",
+            "foo.localhost",
+            "a.b.LocalHost",
+            "ip6-loopback",
+        ] {
+            assert!(is_localhost_name(h), "{h}");
+        }
+        for h in ["localhost.example", "notlocalhost", "example.com", "host"] {
+            assert!(!is_localhost_name(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn numeric_hosts_are_detected() {
+        for h in [
+            "2130706433",
+            "127.1",
+            "0177.0.0.1",
+            "0x7f000001",
+            "1.0x7f",
+            "10.0.0.",
+        ] {
+            assert!(is_numeric_host(h), "{h}");
+        }
+        for h in [
+            "example.com",
+            "1.example",
+            "x",
+            "0x",
+            "a1.b2",
+            "xn--80ak6aa92e.com",
+        ] {
+            assert!(!is_numeric_host(h), "{h}");
+        }
+    }
 
     #[test]
     fn test_parse_acl_config() {
@@ -1606,6 +1738,250 @@ acl:
         let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
         // direct config is None, should use default "auto" mode
         assert!(config.outbounds[0].direct.is_none());
+    }
+
+    /// Protocol-qualified rules must see UDP sessions as UDP: `route_udp`
+    /// on a `udp/443` reject rule rejects, while `route` (TCP) does not.
+    #[tokio::test]
+    async fn test_acl_router_route_udp_uses_udp_protocol() {
+        use crate::core::hooks::{OutboundRouter, OutboundType};
+        use crate::core::Address;
+
+        let yaml = r#"
+outbounds: []
+acl:
+  inline:
+    - reject(all, udp/443)
+    - direct(all)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let router = AclRouter::with_cache(engine, false, dns_cache_rs::DnsCache::new());
+
+        let addr = Address::IPv4([1, 1, 1, 1], 443);
+        assert!(matches!(
+            router.route(&addr).await,
+            OutboundType::Direct { .. }
+        ));
+        assert!(matches!(
+            router.route_udp(&addr).await,
+            OutboundType::Reject
+        ));
+        let other = Address::IPv4([1, 1, 1, 1], 53);
+        assert!(matches!(
+            router.route_udp(&other).await,
+            OutboundType::Direct { .. }
+        ));
+    }
+
+    /// Match before resolve: a domain routed to a proxy is never resolved
+    /// locally (no DNS leak) and is proxied even if it would resolve to a
+    /// private address here; a direct domain is still screened.
+    #[tokio::test]
+    async fn test_acl_router_matches_before_resolving() {
+        use crate::core::hooks::{OutboundRouter, OutboundType};
+        use crate::core::Address;
+        use dns_cache_rs::{DnsCache, MockResolver};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let yaml = r#"
+outbounds:
+  - name: warp
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:40000
+acl:
+  inline:
+    - warp(suffix:corp.internal)
+    - direct(all)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let mock = Arc::new(MockResolver::new());
+        mock.set(
+            "app.corp.internal",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))]),
+        );
+        mock.set(
+            "pub.example",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]),
+        );
+        mock.set(
+            "lan.example",
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))]),
+        );
+        let cache = DnsCache::builder()
+            .resolver_arc(mock.clone() as Arc<dyn dns_cache_rs::Resolver>)
+            .build()
+            .unwrap();
+        let router = AclRouter::with_cache(engine, true, cache);
+
+        // proxied domain: Proxy even though it resolves privately, and no lookup performed
+        let r = router
+            .route(&Address::Domain("app.corp.internal".into(), 443))
+            .await;
+        assert!(matches!(r, OutboundType::Proxy { .. }), "{r:?}");
+        assert_eq!(
+            mock.call_count("app.corp.internal"),
+            0,
+            "proxied domain must not be resolved locally"
+        );
+
+        // direct domain resolving privately → Reject; public → Direct with resolved addr
+        assert!(matches!(
+            router
+                .route(&Address::Domain("lan.example".into(), 80))
+                .await,
+            OutboundType::Reject
+        ));
+        assert!(matches!(
+            router
+                .route(&Address::Domain("pub.example".into(), 80))
+                .await,
+            OutboundType::Direct {
+                resolved: Some(_),
+                ..
+            }
+        ));
+        // private literal is rejected before any rule
+        assert!(matches!(
+            router.route(&Address::IPv4([10, 1, 1, 1], 80)).await,
+            OutboundType::Reject
+        ));
+    }
+
+    /// `block_private_ip` applies to IP literals whatever the rule says: a
+    /// proxy rule must not let a client reach the proxy host's loopback/LAN.
+    #[tokio::test]
+    async fn test_acl_router_blocks_private_literal_even_when_rule_proxies() {
+        use crate::core::hooks::{OutboundRouter, OutboundType};
+        use crate::core::Address;
+        use dns_cache_rs::{DnsCache, MockResolver};
+
+        let yaml = r#"
+outbounds:
+  - name: warp
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:40000
+acl:
+  inline:
+    - warp(all)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let cache = DnsCache::builder()
+            .resolver_arc(Arc::new(MockResolver::new()) as Arc<dyn dns_cache_rs::Resolver>)
+            .build()
+            .unwrap();
+        let router = AclRouter::with_cache(engine, true, cache);
+
+        for private in [
+            Address::IPv4([127, 0, 0, 1], 22),
+            Address::IPv4([169, 254, 169, 254], 80),
+            Address::IPv4([10, 0, 0, 1], 443),
+            Address::IPv6(std::net::Ipv6Addr::LOCALHOST.octets(), 22),
+            // domain-typed literals (folded by the header parser, but the
+            // router must not depend on that)
+            Address::Domain("127.0.0.1".into(), 22),
+            Address::Domain("::1".into(), 22),
+            // inet_aton forms the proxy host would resolve to loopback
+            Address::Domain("2130706433".into(), 22),
+            Address::Domain("127.1".into(), 22),
+            Address::Domain("0x7f000001".into(), 22),
+            Address::Domain("localhost".into(), 6379),
+            Address::Domain("db.localhost".into(), 6379),
+        ] {
+            let r = router.route(&private).await;
+            assert!(matches!(r, OutboundType::Reject), "{private}: {r:?}");
+            let r = router.route_udp(&private).await;
+            assert!(matches!(r, OutboundType::Reject), "udp {private}: {r:?}");
+        }
+        // public literals and domains still go through the proxy
+        let r = router.route(&Address::IPv4([1, 1, 1, 1], 443)).await;
+        assert!(matches!(r, OutboundType::Proxy { .. }), "{r:?}");
+        let r = router
+            .route(&Address::Domain("example.com".into(), 443))
+            .await;
+        assert!(matches!(r, OutboundType::Proxy { .. }), "{r:?}");
+
+        // with blocking disabled the proxy rule wins
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let cache = DnsCache::builder()
+            .resolver_arc(Arc::new(MockResolver::new()) as Arc<dyn dns_cache_rs::Resolver>)
+            .build()
+            .unwrap();
+        let router = AclRouter::with_cache(engine, false, cache);
+        let r = router.route(&Address::IPv4([127, 0, 0, 1], 22)).await;
+        assert!(matches!(r, OutboundType::Proxy { .. }), "{r:?}");
+    }
+
+    /// `outbound(match, proto/port, hijackAddress)` rewrites the destination:
+    /// direct rules connect to the hijack IP, proxy rules carry it along.
+    #[tokio::test]
+    async fn test_acl_router_applies_hijack_address() {
+        use crate::core::hooks::{OutboundRouter, OutboundType};
+        use crate::core::Address;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let yaml = r#"
+outbounds:
+  - name: warp
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:40000
+      allow_udp: true
+acl:
+  inline:
+    - direct(all, udp/53, 8.8.8.8)
+    - warp(suffix:corp.internal, tcp/443, 10.0.0.9)
+    - direct(all)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let router = AclRouter::with_cache(engine, true, dns_cache_rs::DnsCache::new());
+
+        match router
+            .route_udp(&Address::Domain("dns.example".into(), 53))
+            .await
+        {
+            OutboundType::Direct {
+                resolved: Some(r), ..
+            } => {
+                assert_eq!(r.v4, Some(Ipv4Addr::new(8, 8, 8, 8)));
+                assert_eq!(r.port, 53);
+            }
+            other => panic!("expected hijacked direct, got {other:?}"),
+        }
+        match router
+            .route(&Address::Domain("app.corp.internal".into(), 443))
+            .await
+        {
+            OutboundType::Proxy { hijack, .. } => {
+                assert_eq!(hijack, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))));
+            }
+            other => panic!("expected proxy with hijack, got {other:?}"),
+        }
+        // an operator-configured hijack to a private address (DNS to a local
+        // resolver) is trusted: block_private_ip screens client input only
+        let yaml = r#"
+outbounds: []
+acl:
+  inline:
+    - direct(all, udp/53, 127.0.0.1)
+"#;
+        let config: AclConfig = serde_yaml::from_str(yaml).unwrap();
+        let engine = AclEngine::new(config, None, false).await.unwrap();
+        let router = AclRouter::with_cache(engine, true, dns_cache_rs::DnsCache::new());
+        match router.route_udp(&Address::IPv4([8, 8, 8, 8], 53)).await {
+            OutboundType::Direct {
+                resolved: Some(r), ..
+            } => {
+                assert_eq!(r.socket_addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            }
+            other => panic!("expected hijacked direct, got {other:?}"),
+        }
     }
 
     #[test]

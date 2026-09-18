@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 ///
 /// Creates an IPv6 socket with `IPV6_V6ONLY` disabled so it accepts both
 /// IPv4 (mapped) and IPv6 connections. Falls back to IPv4-only (`0.0.0.0`)
-/// if IPv6 is unsupported on the system.
+/// if the dual-stack bind fails.
 pub fn bind_dual_stack(port: u16, tcp_backlog: i32) -> Result<TcpListener> {
     match try_bind_dual_stack(port, tcp_backlog) {
         Ok(listener) => Ok(listener),
@@ -58,6 +58,24 @@ fn is_ipv6_unsupported(err: &anyhow::Error) -> bool {
     }
 }
 
+/// TCP keepalive interval — matches Go's net.ListenConfig default (15s).
+/// Dead peers are detected in ~45s (3 probes × 15s).
+pub const TCP_KEEPALIVE_SECS: u64 = 15;
+
+/// Apply the per-socket tuning used for every TCP stream we own (inbound
+/// accepts and direct outbound connects): optional TCP_NODELAY plus keepalive
+/// so dead peers (mobile disconnect, network change) are detected.
+pub fn tune_tcp_stream(stream: &tokio::net::TcpStream, nodelay: bool) {
+    use socket2::{SockRef, TcpKeepalive};
+    if nodelay {
+        let _ = stream.set_nodelay(true);
+    }
+    let keepalive = TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+        .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
+    let _ = SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,7 +85,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dual_stack_accepts_ipv4() {
-        let listener = bind_dual_stack(0, 128).expect("bind failed");
+        let listener = bind_dual_stack(0, 1024).expect("bind failed");
         let port = listener.local_addr().unwrap().port();
 
         let connect = TcpStream::connect(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port));
@@ -92,7 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dual_stack_accepts_ipv6() {
-        let listener = bind_dual_stack(0, 128).expect("bind failed");
+        let listener = bind_dual_stack(0, 1024).expect("bind failed");
         let port = listener.local_addr().unwrap().port();
 
         let connect = TcpStream::connect(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port));
@@ -111,7 +129,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dual_stack_local_addr_is_ipv6() {
-        let listener = bind_dual_stack(0, 128).expect("bind failed");
+        let listener = bind_dual_stack(0, 1024).expect("bind failed");
         let local_addr = listener.local_addr().unwrap();
         assert!(
             local_addr.is_ipv6(),
@@ -121,7 +139,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_dual_stack_uses_custom_backlog() {
-        let listener = bind_dual_stack(0, 64).expect("bind failed");
+        // Just verify it doesn't panic with a non-default backlog
+        let listener = bind_dual_stack(0, 128).expect("bind with custom backlog failed");
         assert!(listener.local_addr().is_ok());
     }
 }

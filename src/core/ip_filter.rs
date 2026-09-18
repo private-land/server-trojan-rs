@@ -2,7 +2,7 @@
 //!
 //! Provides functions to detect private, loopback, and link-local addresses.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Check if an IPv4 address is private/loopback/link-local/reserved
 pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
@@ -17,11 +17,44 @@ pub fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
         || ip.is_multicast() // 224.0.0.0/4
 }
 
-/// Check if an IPv6 address is private/loopback/link-local/ULA
+/// Private/loopback/link-local check for either family.
+pub fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_private_ipv4(v4),
+        IpAddr::V6(v6) => is_private_ipv6(v6),
+    }
+}
+
+/// Check if an IPv6 address is private/loopback/link-local/ULA, or an IPv6
+/// form that embeds a private IPv4 address (IPv4-mapped `::ffff:a.b.c.d`,
+/// IPv4-compatible `::a.b.c.d`, NAT64 `64:ff9b::a.b.c.d`).
 pub fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    ip.is_loopback()           // ::1
+    if let Some(v4) = embedded_ipv4(ip) {
+        return is_private_ipv4(&v4);
+    }
+    ip.is_unspecified()        // ::
+        || ip.is_loopback()    // ::1
+        || ip.is_multicast()   // ff00::/8
         || is_ipv6_ula(ip)     // fc00::/7 (Unique Local Address)
         || is_ipv6_link_local(ip) // fe80::/10
+}
+
+/// IPv4 address carried inside an IPv6 one, if any.
+fn embedded_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    // NAT64 well-known prefix 64:ff9b::/96
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32));
+    }
+    // ::ffff:a.b.c.d
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    // the deprecated ::a.b.c.d, excluding :: and ::1 (handled as IPv6)
+    if s[..6] == [0; 6] && (s[6] != 0 || s[7] > 1) {
+        return Some(Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32));
+    }
+    None
 }
 
 /// Check if IPv6 is Unique Local Address (fc00::/7)
@@ -38,6 +71,25 @@ fn is_ipv6_link_local(ip: &Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipv6_forms_embedding_private_ipv4_are_private() {
+        use super::is_private_ipv6;
+        use std::net::Ipv6Addr;
+        for s in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.5",
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "::",
+            "ff02::1",
+        ] {
+            assert!(is_private_ipv6(&s.parse::<Ipv6Addr>().unwrap()), "{s}");
+        }
+        for s in ["::ffff:8.8.8.8", "64:ff9b::808:808", "2001:db8::1"] {
+            assert!(!is_private_ipv6(&s.parse::<Ipv6Addr>().unwrap()), "{s}");
+        }
+    }
+
     use super::*;
 
     #[test]
