@@ -14,6 +14,45 @@ pub use panel_core::{
 pub type TrojanUserManager = UserManager<[u8; 56]>;
 pub use panel_http::{HttpApiManager as ApiManager, HttpPanelConfig as PanelConfig, IpVersion};
 
+/// Submit everything the collector has accumulated right now.
+///
+/// Used once at shutdown *before* the node unregisters: after `unregister`
+/// the HTTP client has no `register_id` and the background task's own final
+/// report fails with "Not registered", silently dropping the drained traffic.
+pub async fn flush_traffic(api: &dyn panel_core::PanelApi, stats: &PanelStatsCollector) {
+    let snapshots = stats.reset_all();
+    if snapshots.is_empty() {
+        return;
+    }
+    let data: Vec<panel_core::UserTraffic> = snapshots
+        .iter()
+        .map(|s| panel_core::UserTraffic {
+            user_id: s.user_id,
+            upload: s.upload_bytes,
+            download: s.download_bytes,
+            request_count: s.request_count,
+        })
+        .collect();
+    let (users, up, down) = (
+        data.len(),
+        data.iter().map(|t| t.upload).sum::<u64>(),
+        data.iter().map(|t| t.download).sum::<u64>(),
+    );
+    match api.submit_traffic(data).await {
+        Ok(()) => tracing::info!(
+            users,
+            upload = up,
+            download = down,
+            "Final traffic reported"
+        ),
+        Err(e) => {
+            // keep it for the background task's own attempt (and the log)
+            stats.restore(&snapshots);
+            tracing::warn!(error = %e, "Failed to report final traffic before unregister");
+        }
+    }
+}
+
 /// Newtype bridging panel::StatsCollector to core::hooks::StatsCollector trait
 pub struct TrojanStatsCollector(pub Arc<PanelStatsCollector>);
 

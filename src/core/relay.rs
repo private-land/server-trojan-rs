@@ -47,9 +47,6 @@ pub struct CopyResult {
     pub a_to_b: u64,
     /// Bytes transferred from B to A (download)
     pub b_to_a: u64,
-    /// Whether the copy completed normally (true) or timed out (false)
-    #[allow(dead_code)]
-    pub completed: bool,
     /// How the relay terminated
     pub termination: RelayTermination,
     /// Whether client (a) reader received EOF
@@ -114,6 +111,14 @@ impl DirectionalBuffer {
     #[inline]
     fn has_read_eof(&self) -> bool {
         self.read_done
+    }
+
+    /// EOF seen and every buffered byte handed to the writer: only now is
+    /// this direction "finished" in the Xray sense (request/response copy
+    /// done), so the other direction's half-close window may start.
+    #[inline]
+    fn is_drained(&self) -> bool {
+        self.read_done && self.pos >= self.cap
     }
 
     #[inline]
@@ -186,10 +191,12 @@ impl DirectionalBuffer {
                                         self.cap += n;
                                     }
                                 }
-                                Poll::Ready(Err(_)) => {
-                                    // Reader broken — treat as EOF for timer purposes.
-                                    // Error propagated on next normal read cycle.
-                                    self.read_done = true;
+                                Poll::Ready(Err(e)) => {
+                                    // Reader broken (e.g. VMess chunk auth failure or
+                                    // ECONNRESET): surface it now. Marking EOF here would
+                                    // never reach the normal read path again and would
+                                    // turn a corrupted session into a clean shutdown.
+                                    return Poll::Ready(Err(e));
                                 }
                                 Poll::Pending => {}
                             }
@@ -245,8 +252,8 @@ impl DirectionalBuffer {
 /// - `a`: Client stream
 /// - `b`: Remote/outbound stream
 /// - `idle_timeout_secs`: Disconnect if no data flows for this many seconds
-/// - `uplink_only_secs`: After client EOF (a→b done), wait this long for remote (b→a) to finish (Xray: uplinkOnly=2s)
-/// - `downlink_only_secs`: After remote EOF (b→a done), wait this long for client (a→b) to finish (Xray: downlinkOnly=5s)
+/// - `uplink_only_secs`: After remote EOF (b→a done), wait this long for the client's upload (a→b) to finish (Xray: uplinkOnly=2s)
+/// - `downlink_only_secs`: After client EOF (a→b done), wait this long for the remote's download (b→a) to finish (Xray: downlinkOnly=5s)
 /// - `buffer_size`: Buffer size for each direction of the relay
 /// - `stats`: Optional (user_id, stats_collector) for traffic tracking
 pub async fn copy_bidirectional_with_stats<A, B>(
@@ -275,6 +282,7 @@ where
     let half_close_sleep = tokio::time::sleep(tokio::time::Duration::ZERO);
     tokio::pin!(half_close_sleep);
     let mut half_close_active = false;
+    let mut half_close_timeout = tokio::time::Duration::ZERO;
 
     // Idle timeout: single Sleep that resets on every data transfer.
     // Unlike interval(30s), this avoids waking active connections every 30s
@@ -283,8 +291,10 @@ where
     tokio::pin!(idle_sleep);
 
     let mut termination = RelayTermination::Completed;
+    let mut reported_up: u64 = 0;
+    let mut reported_down: u64 = 0;
 
-    let result: io::Result<bool> = std::future::poll_fn(|cx| {
+    let result: io::Result<()> = std::future::poll_fn(|cx| {
         let a_bytes_before = a_to_b.bytes_transferred();
         let b_bytes_before = b_to_a.bytes_transferred();
 
@@ -316,19 +326,41 @@ where
         // poll_copy from returning Ready(Ok(())), and the half-close timer
         // was never set. Meanwhile the other direction kept transferring data,
         // resetting the idle timer — causing the connection to live forever.
-        if a_to_b.has_read_eof() && !b_to_a.is_done() && !half_close_active {
-            // Client closed (upload EOF) → use uplinkOnly timeout for remaining download
+        // Xray semantics (proxy/trojan/inbound): when the request direction
+        // (client→remote) finishes only the downlink remains → DownlinkOnly;
+        // when the response direction finishes only the uplink remains →
+        // UplinkOnly.
+        if a_to_b.is_drained() && !b_to_a.is_done() && !half_close_active {
+            // Client closed (upload EOF) → wait downlinkOnly for the remaining download
             half_close_active = true;
+            half_close_timeout = downlink_only_timeout;
             half_close_sleep
                 .as_mut()
-                .reset(tokio::time::Instant::now() + uplink_only_timeout);
+                .reset(tokio::time::Instant::now() + half_close_timeout);
         }
-        if b_to_a.has_read_eof() && !a_to_b.is_done() && !half_close_active {
-            // Remote closed (download EOF) → use downlinkOnly timeout for remaining upload
+        if b_to_a.is_drained() && !a_to_b.is_done() && !half_close_active {
+            // Remote closed (download EOF) → wait uplinkOnly for the remaining upload
             half_close_active = true;
+            half_close_timeout = uplink_only_timeout;
             half_close_sleep
                 .as_mut()
-                .reset(tokio::time::Instant::now() + downlink_only_timeout);
+                .reset(tokio::time::Instant::now() + half_close_timeout);
+        }
+
+        // Report traffic incrementally: this future is dropped on kick,
+        // graceful shutdown and transport-level cancellation, and bytes
+        // only reported after completion would then never be billed.
+        if let Some((user_id, collector)) = &stats {
+            let up = a_to_b.bytes_transferred();
+            if up > reported_up {
+                collector.record_upload(*user_id, up - reported_up);
+                reported_up = up;
+            }
+            let down = b_to_a.bytes_transferred();
+            if down > reported_down {
+                collector.record_download(*user_id, down - reported_down);
+                reported_down = down;
+            }
         }
 
         // Reset idle deadline only when data is confirmed sent to the wire.
@@ -354,24 +386,32 @@ where
             idle_sleep
                 .as_mut()
                 .reset(tokio::time::Instant::now() + idle_timeout);
+            // Like Xray's ActivityTimer.SetTimeout, the half-close timeout is an
+            // inactivity window, not a hard deadline: a long download after the
+            // client half-closed keeps the session alive while bytes flow.
+            if half_close_active {
+                half_close_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + half_close_timeout);
+            }
         }
 
         // Both directions done → completed normally
         if a_to_b.is_done() && b_to_a.is_done() {
             termination = RelayTermination::Completed;
-            return Poll::Ready(Ok(true));
+            return Poll::Ready(Ok(()));
         }
 
         // Half-close timeout
         if half_close_active && half_close_sleep.as_mut().poll(cx).is_ready() {
             termination = RelayTermination::HalfCloseTimeout;
-            return Poll::Ready(Ok(false));
+            return Poll::Ready(Ok(()));
         }
 
         // Idle timeout: fires precisely after idle_timeout_secs of inactivity
         if idle_sleep.as_mut().poll(cx).is_ready() {
             termination = RelayTermination::IdleTimeout;
-            return Poll::Ready(Ok(false));
+            return Poll::Ready(Ok(()));
         }
 
         Poll::Pending
@@ -390,13 +430,14 @@ where
     // blocked on poll_flush (e.g. tungstenite flush to slow realm), causing
     // up to 10s extra delay per connection and connection accumulation at peak.
 
-    // Always record traffic stats — regardless of success, timeout, or error
-    if let Some((user_id, collector)) = stats {
-        if a_to_b_bytes > 0 {
-            collector.record_upload(user_id, a_to_b_bytes);
+    // Report whatever the last poll did not (an error return skips the
+    // per-poll accounting above).
+    if let Some((user_id, collector)) = &stats {
+        if a_to_b_bytes > reported_up {
+            collector.record_upload(*user_id, a_to_b_bytes - reported_up);
         }
-        if b_to_a_bytes > 0 {
-            collector.record_download(user_id, b_to_a_bytes);
+        if b_to_a_bytes > reported_down {
+            collector.record_download(*user_id, b_to_a_bytes - reported_down);
         }
     }
 
@@ -404,10 +445,9 @@ where
     let remote_eof = b_to_a.has_read_eof();
 
     match result {
-        Ok(completed) => Ok(CopyResult {
+        Ok(()) => Ok(CopyResult {
             a_to_b: a_to_b_bytes,
             b_to_a: b_to_a_bytes,
-            completed,
             termination,
             client_eof,
             remote_eof,
@@ -427,7 +467,6 @@ mod tests {
         let result = CopyResult {
             a_to_b: 100,
             b_to_a: 200,
-            completed: true,
             termination: RelayTermination::Completed,
             client_eof: true,
             remote_eof: true,
@@ -435,7 +474,7 @@ mod tests {
         let cloned = result;
         assert_eq!(cloned.a_to_b, 100);
         assert_eq!(cloned.b_to_a, 200);
-        assert!(cloned.completed);
+        assert_eq!(cloned.termination, RelayTermination::Completed);
     }
 
     #[tokio::test]
@@ -448,7 +487,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.completed);
+        assert_eq!(result.termination, RelayTermination::Completed);
         assert!(result.a_to_b > 0);
     }
 
@@ -589,10 +628,10 @@ mod tests {
         }
     }
 
-    /// When client sends EOF first (a→b done), uplink_only timeout should apply.
-    /// Uses asymmetric timeouts (1s vs 100s) to verify the correct one fires.
+    /// When client sends EOF first (a→b done), downlink_only applies (Xray:
+    /// request done → DownlinkOnly). Asymmetric timeouts verify which fires.
     #[tokio::test(start_paused = true)]
-    async fn test_uplink_only_timeout_on_client_eof() {
+    async fn test_downlink_only_timeout_on_client_eof() {
         let mut client = Cursor::new(b"hello".to_vec()); // Will EOF after data
         let mut remote = NeverEofSink; // Never sends EOF back
 
@@ -601,33 +640,37 @@ mod tests {
             &mut client,
             &mut remote,
             300, // idle timeout (high, won't trigger)
-            1,   // uplink_only = 1s (THIS should fire)
-            100, // downlink_only = 100s (should NOT fire)
+            100, // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            1,   // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )
         .await
         .unwrap();
 
-        assert!(!result.completed, "Should timeout, not complete normally");
+        assert_ne!(
+            result.termination,
+            RelayTermination::Completed,
+            "Should timeout, not complete normally"
+        );
         assert!(result.a_to_b > 0, "Client data should have been relayed");
         // With paused time, mocked clock should advance to uplink_only (1s)
         let elapsed = start.elapsed();
         assert!(
             elapsed >= tokio::time::Duration::from_secs(1),
-            "Should wait at least uplink_only timeout"
+            "Should wait at least downlink_only timeout"
         );
         assert!(
             elapsed < tokio::time::Duration::from_secs(10),
-            "Should NOT wait for downlink_only (100s), elapsed={:?}",
+            "Should NOT wait for uplink_only (100s), elapsed={:?}",
             elapsed
         );
     }
 
-    /// When remote sends EOF first (b→a done), downlink_only timeout should apply.
-    /// Uses asymmetric timeouts (100s vs 1s) to verify the correct one fires.
+    /// When remote sends EOF first (b→a done), uplink_only applies (Xray:
+    /// response done → UplinkOnly). Asymmetric timeouts verify which fires.
     #[tokio::test(start_paused = true)]
-    async fn test_downlink_only_timeout_on_remote_eof() {
+    async fn test_uplink_only_timeout_on_remote_eof() {
         let mut client = NeverEofSink; // Never sends EOF
         let mut remote = Cursor::new(b"world".to_vec()); // Will EOF after data
 
@@ -636,15 +679,19 @@ mod tests {
             &mut client,
             &mut remote,
             300, // idle timeout (high, won't trigger)
-            100, // uplink_only = 100s (should NOT fire)
-            1,   // downlink_only = 1s (THIS should fire)
+            1,   // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            100, // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )
         .await
         .unwrap();
 
-        assert!(!result.completed, "Should timeout, not complete normally");
+        assert_ne!(
+            result.termination,
+            RelayTermination::Completed,
+            "Should timeout, not complete normally"
+        );
         assert!(result.b_to_a > 0, "Remote data should have been relayed");
         let elapsed = start.elapsed();
         assert!(
@@ -697,12 +744,123 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!result.completed);
+        assert_ne!(result.termination, RelayTermination::Completed);
         assert_eq!(
             collector.upload.load(AtomicOrdering::Relaxed),
             result.a_to_b,
             "Upload stats should match bytes transferred"
         );
+    }
+
+    /// Traffic must be billed even when the relay future is dropped before it
+    /// resolves (kick, graceful shutdown, transport cancellation).
+    #[tokio::test(start_paused = true)]
+    async fn test_stats_recorded_when_relay_future_is_dropped() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        struct RecordingCollector(AtomicU64);
+        impl StatsCollector for RecordingCollector {
+            fn record_request(&self, _: UserId) {}
+            fn record_upload(&self, _: UserId, bytes: u64) {
+                self.0.fetch_add(bytes, AtomicOrdering::Relaxed);
+            }
+            fn record_download(&self, _: UserId, _: u64) {}
+        }
+        let collector = Arc::new(RecordingCollector(AtomicU64::new(0)));
+
+        let mut client = Cursor::new(b"upload-data".to_vec());
+        let mut remote = NeverEofSink;
+        let relay = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300,
+            100, // both half-close timers far away: the relay is still pending when dropped
+            100,
+            1024,
+            Some((42, Arc::clone(&collector) as Arc<dyn StatsCollector>)),
+        );
+        tokio::select! {
+            _ = relay => panic!("relay must still be waiting on the half-close timer"),
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
+        }
+        assert_eq!(collector.0.load(AtomicOrdering::Relaxed), 11);
+    }
+
+    /// Reader that yields one chunk per `gap`, `n` times, then EOF — models a
+    /// remote still streaming a response after the client half-closed.
+    struct DrippingReader {
+        left: usize,
+        gap: tokio::time::Duration,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+    impl AsyncRead for DrippingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.left == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if self.sleep.is_none() {
+                let gap = self.gap;
+                self.sleep = Some(Box::pin(tokio::time::sleep(gap)));
+            }
+            match self.sleep.as_mut().unwrap().as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    self.sleep = None;
+                    self.left -= 1;
+                    buf.put_slice(b"chunk");
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+    impl AsyncWrite for DrippingReader {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(b.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// After the client half-closes, a response that keeps flowing must not be
+    /// cut by downlink_only as a hard deadline (Xray: inactivity timeout).
+    #[tokio::test(start_paused = true)]
+    async fn half_close_timeout_is_reset_by_activity() {
+        let mut client = Cursor::new(b"GET".to_vec()); // EOF right after the request
+        let mut remote = DrippingReader {
+            left: 10,
+            gap: tokio::time::Duration::from_secs(1),
+            sleep: None,
+        };
+        let result = copy_bidirectional_with_stats(
+            &mut client,
+            &mut remote,
+            300,
+            100, // uplink_only
+            2,   // downlink_only = 2s of inactivity; data arrives every 1s for 10s
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.termination,
+            RelayTermination::Completed,
+            "download must finish: {:?}",
+            result.termination
+        );
+        assert_eq!(result.b_to_a, 50);
     }
 
     /// A stream where poll_shutdown always returns Pending (simulates WS flush
@@ -776,8 +934,8 @@ mod tests {
             &mut client,
             &mut remote,
             300, // idle timeout 300s (should NOT trigger)
-            100, // uplink_only = 100s (should NOT trigger)
-            2,   // downlink_only = 2s (THIS should fire after remote EOF)
+            2,   // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            100, // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )
@@ -785,7 +943,11 @@ mod tests {
         .unwrap();
 
         let elapsed = start.elapsed();
-        assert!(!result.completed, "Should timeout, not complete normally");
+        assert_ne!(
+            result.termination,
+            RelayTermination::Completed,
+            "Should timeout, not complete normally"
+        );
         assert!(
             elapsed >= tokio::time::Duration::from_secs(2),
             "Should wait at least downlink_only timeout"
@@ -843,8 +1005,8 @@ mod tests {
             &mut client,
             &mut remote,
             300, // idle timeout (should NOT trigger)
-            2,   // uplink_only = 2s (THIS should fire after client EOF)
-            100, // downlink_only = 100s (should NOT trigger)
+            100, // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            2,   // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )
@@ -852,7 +1014,7 @@ mod tests {
         .unwrap();
 
         let elapsed = start.elapsed();
-        assert!(!result.completed);
+        assert_ne!(result.termination, RelayTermination::Completed);
         assert!(result.a_to_b > 0, "Client data should have been relayed");
         assert!(
             elapsed >= tokio::time::Duration::from_secs(2),
@@ -890,8 +1052,8 @@ mod tests {
             &mut client,
             &mut remote,
             300, // idle timeout (won't trigger)
-            100, // uplink_only (won't trigger)
-            2,   // downlink_only = 2s (fires after remote EOF)
+            2,   // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            100, // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )
@@ -899,7 +1061,7 @@ mod tests {
         .unwrap();
 
         let elapsed = start.elapsed();
-        assert!(!result.completed);
+        assert_ne!(result.termination, RelayTermination::Completed);
         // Should complete in ~2s (half-close timeout only).
         // Old code: 2s + 5s (shutdown a) + 5s (shutdown b) = 12s
         assert!(
@@ -925,7 +1087,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.completed);
+        assert_eq!(result.termination, RelayTermination::Completed);
         assert!(result.a_to_b > 0);
 
         // Key: streams are still accessible after relay (not moved into the future).
@@ -1125,8 +1287,8 @@ mod tests {
             &mut client,
             &mut remote,
             30,  // idle timeout = 30s (should NOT fire if flush works)
-            2,   // uplink_only = 2s (fires after client EOF from successful flush)
-            100, // downlink_only (should NOT fire)
+            100, // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            2,   // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )
@@ -1230,20 +1392,19 @@ mod tests {
         }
     }
 
-    /// Regression test: poll_write blocking in relay prevents EOF detection,
-    /// causing connections to wait for idle timeout (300s) instead of half-close (2-5s).
+    /// A blocked write with bytes still buffered is governed by the idle
+    /// timeout, not by the half-close window (Xray semantics: UplinkOnly /
+    /// DownlinkOnly only arm once the copy, including its writes, is done).
+    /// Otherwise a brief stall of the receiving side after the sender's EOF
+    /// would discard the tail of the transfer.
     ///
-    /// Scenario: target sends two chunks then closes. Trojan writes chunk1 to
-    /// client WS successfully, reads chunk2, but poll_write for chunk2 returns
-    /// Pending (WS sink full, realm's TCP buffer full). poll_copy is stuck at
-    /// the write step, never reads the next chunk from remote which would be EOF.
-    /// Without EOF, half-close timer never starts → connection waits for idle timeout.
-    ///
-    /// This is the same class of bug as flush-blocking (v0.2.6 fix), but at the
-    /// write stage instead of the flush stage. Affects responses > buffer_size
-    /// through realm connections.
+    /// Scenario: target sends two chunks then closes. The relay writes chunk1
+    /// to the client, reads chunk2, but poll_write for chunk2 stays Pending
+    /// (realm's TCP buffer full). The EOF probe still sees the remote close,
+    /// yet the half-close timer must not start while chunk2 is unwritten;
+    /// the connection ends via the idle timeout instead.
     #[tokio::test(start_paused = true)]
-    async fn test_half_close_fires_when_write_blocks_before_eof() {
+    async fn test_blocked_write_with_pending_bytes_waits_for_idle_not_half_close() {
         // Client: accepts first write (chunk1), then blocks (realm buffer full)
         let mut client = WriteBlocksAfterN {
             writes_remaining: 1,
@@ -1258,9 +1419,9 @@ mod tests {
         let result = copy_bidirectional_with_stats(
             &mut client,
             &mut remote,
-            30,  // idle timeout = 30s (fallback — should NOT be needed)
-            100, // uplink_only (should NOT fire)
-            2,   // downlink_only = 2s (THIS should fire after remote EOF detected)
+            30,  // idle timeout = 30s — governs this case
+            2,   // uplink_only: would fire at 2s if (wrongly) armed with pending bytes
+            100, // downlink_only
             1024,
             None,
         )
@@ -1268,17 +1429,10 @@ mod tests {
         .unwrap();
 
         let elapsed = start.elapsed();
-        assert!(!result.completed, "Should timeout, not complete normally");
+        assert_eq!(result.termination, RelayTermination::IdleTimeout);
         assert!(
-            elapsed >= tokio::time::Duration::from_secs(2),
-            "Should wait at least downlink_only timeout"
-        );
-        // Key: should close at ~2s (half-close), NOT at ~30s (idle timeout).
-        // Bug: poll_write blocks poll_copy from reading remote EOF, so half-close
-        // timer never starts, and connection waits for idle timeout instead.
-        assert!(
-            elapsed < tokio::time::Duration::from_secs(10),
-            "Should fire at half-close (~2s), not idle timeout (30s), elapsed={:?}",
+            elapsed >= tokio::time::Duration::from_secs(30),
+            "half-close must not fire while chunk2 is unwritten, elapsed={:?}",
             elapsed
         );
     }
@@ -1306,8 +1460,8 @@ mod tests {
             &mut client,
             &mut remote,
             30,  // idle timeout = 30s (fallback — should NOT be needed)
-            100, // uplink_only (should NOT fire)
-            2,   // downlink_only = 2s (THIS should fire after remote EOF detected)
+            2,   // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            100, // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )
@@ -1315,7 +1469,11 @@ mod tests {
         .unwrap();
 
         let elapsed = start.elapsed();
-        assert!(!result.completed, "Should timeout, not complete normally");
+        assert_ne!(
+            result.termination,
+            RelayTermination::Completed,
+            "Should timeout, not complete normally"
+        );
         assert!(
             elapsed >= tokio::time::Duration::from_secs(2),
             "Should wait at least downlink_only timeout"
@@ -1546,8 +1704,8 @@ mod tests {
             &mut client,
             &mut remote,
             300, // idle timeout = high (should NOT fire)
-            0,   // uplink_only = 0s (immediate after client EOF)
-            300, // downlink_only = high (should NOT fire)
+            300, // uplink_only: applies after remote EOF (Xray uplinkOnly)
+            0,   // downlink_only: applies after client EOF (Xray downlinkOnly)
             1024,
             None,
         )

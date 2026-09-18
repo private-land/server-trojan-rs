@@ -10,7 +10,7 @@
 
 use bytes::{Bytes, BytesMut};
 use std::borrow::Cow;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::logger::log;
 
@@ -73,6 +73,24 @@ pub enum DecodeResult<T> {
 }
 
 impl Address {
+    /// Build an IP-literal address (no domain) for `ip:port`.
+    pub fn from_ip(ip: IpAddr, port: u16) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Address::IPv4(v4.octets(), port),
+            IpAddr::V6(v6) => Address::IPv6(v6.octets(), port),
+        }
+    }
+
+    /// The IP this address names without DNS: IP variants directly, a domain
+    /// only if it parses as an IP literal.
+    pub fn literal_ip(&self) -> Option<IpAddr> {
+        match self {
+            Address::IPv4(ip, _) => Some(IpAddr::V4(Ipv4Addr::from(*ip))),
+            Address::IPv6(ip, _) => Some(IpAddr::V6(Ipv6Addr::from(*ip))),
+            Address::Domain(d, _) => d.parse().ok(),
+        }
+    }
+
     /// Decode address from buffer
     pub fn decode(buf: &[u8]) -> DecodeResult<Self> {
         if buf.is_empty() {

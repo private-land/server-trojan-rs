@@ -70,7 +70,10 @@ async fn main() -> Result<()> {
         node_id: cli.node,
         node_type: panel_core::NodeType::Trojan,
         api_timeout: cli.api_timeout.as_secs(),
-        debug: cli.log_mode == "debug",
+        debug: matches!(
+            cli.log_mode.parse::<logger::LogLevel>(),
+            Ok(logger::LogLevel::Trace | logger::LogLevel::Debug)
+        ),
         data_dir: cli.data_dir.clone(),
         ip_version: cli.panel_ip_version,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -86,32 +89,43 @@ async fn main() -> Result<()> {
     let node_config = api_manager.fetch_config().await?;
     let remote_config = config::parse_trojan_config(node_config)?;
 
+    // Build server config
+    let server_config = config::ServerConfig::from_remote(&remote_config, &cli)?;
+
+    // Everything that can fail on local configuration runs BEFORE the node
+    // registers with the panel, so a bad ACL file or PEM does not leave a
+    // registered-but-dead node behind.
+    let dns_cache = dns_cache_rs::DnsCache::new();
+    let router =
+        server_runner::build_router(&server_config, cli.refresh_geodata, dns_cache.clone()).await?;
+    let tls_config = server_runner::load_tls(&server_config)?;
+
     // Initialize node with port from config
     api_manager.initialize(remote_config.server_port).await?;
     log::info!("Node initialized");
 
-    // Fetch initial users
-    let users = api_manager.fetch_users().await?;
+    // Fetch initial users. From here on the node is registered: any startup
+    // failure must unregister, or the panel keeps a dead node until the
+    // heartbeat expires.
+    let users = match api_manager.fetch_users().await {
+        Ok(users) => users,
+        Err(e) => {
+            log::error!(error = %e, "Failed to fetch initial users, unregistering");
+            if let Err(e2) = api_manager.unregister().await {
+                log::warn!(error = %e2, "Failed to unregister node");
+            }
+            return Err(e);
+        }
+    };
     if let Some(users) = users {
         user_manager.init(&users);
     }
-
-    // Build server config
-    let server_config = config::ServerConfig::from_remote(&remote_config, &cli)?;
 
     // Create authenticator using UserManager
     let authenticator = Arc::new(TrojanAuthenticator(Arc::clone(&user_manager)));
 
     // Create stats collector
     let stats_collector = Arc::new(PanelStatsCollector::new());
-
-    // Construct the shared DNS cache once. `DnsCache: Clone` over Arc, so all
-    // call sites (router, Server) share the same moka-backed storage.
-    let dns_cache = dns_cache_rs::DnsCache::new();
-
-    // Build router from ACL config (shares dns_cache).
-    let router =
-        server_runner::build_router(&server_config, cli.refresh_geodata, dns_cache.clone()).await?;
 
     // Resolve max_connections (auto or fixed) once, then feed the same
     // value to enforcement (ConnConfig) and diagnostics (log).
@@ -229,7 +243,7 @@ async fn main() -> Result<()> {
 
     // Run server (will run until cancel_token is cancelled or error)
     let server_result = tokio::select! {
-        result = server_runner::run_server(server, &server_config) => result,
+        result = server_runner::run_server(server, &server_config, tls_config) => result,
         _ = cancel_token.cancelled() => Ok(()),
     };
 
@@ -264,7 +278,11 @@ async fn main() -> Result<()> {
 
     // Wait for shutdown handler to complete and get api_manager
     if let Ok(api_for_shutdown) = shutdown_handle.await {
-        // Unregister node first — this must complete before supervisor sends SIGKILL.
+        // Report the drained traffic while the registration is still valid:
+        // submit needs the register_id that unregister clears.
+        business::flush_traffic(api_for_shutdown.as_ref(), &stats_collector).await;
+
+        // Unregister node — this must complete before supervisor sends SIGKILL.
         // Background tasks shutdown can take up to 15s (3 tasks × 5s timeout each),
         // so unregister before that to stay within supervisor's stopwaitsecs.
         log::info!("Unregistering node...");
@@ -274,7 +292,7 @@ async fn main() -> Result<()> {
             log::info!("Node unregistered successfully");
         }
 
-        // Shutdown background tasks last (final traffic report includes drained traffic)
+        // Shutdown background tasks last (their final report finds nothing left)
         background_handle.shutdown().await;
     }
 

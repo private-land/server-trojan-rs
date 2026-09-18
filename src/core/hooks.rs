@@ -5,7 +5,6 @@
 use crate::core::Address;
 use async_trait::async_trait;
 use dns_cache_rs::DnsCache;
-use std::net::SocketAddr;
 
 /// User ID type used throughout the system.
 /// Using i64 for consistency with database and API layer.
@@ -34,8 +33,15 @@ pub trait StatsCollector: Send + Sync {
 /// Outbound router trait for routing decisions
 #[async_trait]
 pub trait OutboundRouter: Send + Sync {
-    /// Route based on target address, returns the outbound handler
+    /// Route a TCP session by target address, returns the outbound handler
     async fn route(&self, addr: &Address) -> OutboundType;
+
+    /// Route a UDP session by target address. Protocol-qualified ACL rules
+    /// (`udp/443`) only apply here; routers without protocol awareness fall
+    /// back to `route`.
+    async fn route_udp(&self, addr: &Address) -> OutboundType {
+        self.route(addr).await
+    }
 }
 
 /// Outbound type for routing decisions
@@ -46,13 +52,17 @@ pub enum OutboundType {
     /// the result here so the handler can reuse it instead of resolving again.
     /// The handler is passed when ACL is configured so bind/fastOpen options are respected.
     Direct {
-        resolved: Option<SocketAddr>,
+        resolved: Option<crate::core::dns::ResolvedAddrs>,
         handler: Option<std::sync::Arc<crate::acl::OutboundHandler>>,
     },
     /// Reject connection
     Reject,
-    /// Proxy connection via ACL engine outbound handler
-    Proxy(std::sync::Arc<crate::acl::OutboundHandler>),
+    /// Proxy connection via ACL engine outbound handler. `hijack` rewrites the
+    /// destination (rule `outbound(match, proto/port, hijackAddress)`).
+    Proxy {
+        handler: std::sync::Arc<crate::acl::OutboundHandler>,
+        hijack: Option<std::net::IpAddr>,
+    },
 }
 
 impl std::fmt::Debug for OutboundType {
@@ -65,12 +75,15 @@ impl std::fmt::Debug for OutboundType {
             OutboundType::Direct {
                 resolved: Some(addr),
                 ..
-            } => write!(f, "Direct({})", addr),
+            } => write!(f, "Direct({})", addr.socket_addr()),
             OutboundType::Direct {
                 handler: Some(h), ..
             } => write!(f, "Direct({:?})", h),
             OutboundType::Reject => write!(f, "Reject"),
-            OutboundType::Proxy(handler) => write!(f, "Proxy({:?})", handler),
+            OutboundType::Proxy { handler, hijack } => match hijack {
+                Some(ip) => write!(f, "Proxy({:?} → {})", handler, ip),
+                None => write!(f, "Proxy({:?})", handler),
+            },
         }
     }
 }
@@ -96,20 +109,13 @@ impl DirectRouter {
 #[async_trait]
 impl OutboundRouter for DirectRouter {
     async fn route(&self, addr: &Address) -> OutboundType {
-        if self.block_private_ip {
-            let (is_private, resolved) =
-                crate::core::dns::check_private_and_resolve(&self.dns_cache, addr).await;
-            if is_private {
-                return OutboundType::Reject;
-            }
-            return OutboundType::Direct {
+        use crate::core::dns::{screen_direct_target, DirectTarget};
+        match screen_direct_target(&self.dns_cache, addr, self.block_private_ip).await {
+            DirectTarget::Blocked => OutboundType::Reject,
+            DirectTarget::Allow(resolved) => OutboundType::Direct {
                 resolved,
                 handler: None,
-            };
-        }
-        OutboundType::Direct {
-            resolved: None,
-            handler: None,
+            },
         }
     }
 }
