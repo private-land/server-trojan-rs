@@ -4,10 +4,8 @@
 
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::hooks::UserId;
@@ -19,10 +17,6 @@ pub type ConnectionId = u64;
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
     user_id: UserId,
-    #[allow(dead_code)]
-    peer_addr: SocketAddr,
-    #[allow(dead_code)]
-    connected_at: Instant,
 }
 
 /// Active connection handle with cancellation support
@@ -60,19 +54,11 @@ impl ConnectionManager {
     }
 
     /// Register a new connection and return its ID and cancellation token
-    pub fn register(
-        &self,
-        user_id: UserId,
-        peer_addr: SocketAddr,
-    ) -> (ConnectionId, CancellationToken) {
+    pub fn register(&self, user_id: UserId) -> (ConnectionId, CancellationToken) {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let cancel_token = CancellationToken::new();
 
-        let info = ConnectionInfo {
-            user_id,
-            peer_addr,
-            connected_at: Instant::now(),
-        };
+        let info = ConnectionInfo { user_id };
 
         let conn = ActiveConnection {
             info,
@@ -136,7 +122,7 @@ impl ConnectionManager {
     }
 
     /// Get the number of users with active connections
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn user_count(&self) -> usize {
         self.user_connections.len()
     }
@@ -156,9 +142,9 @@ mod tests {
     #[test]
     fn test_connection_manager_register() {
         let manager = ConnectionManager::new();
-        let (conn_id1, _token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
-        let (conn_id2, _token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
-        let (conn_id3, _token3) = manager.register(2, "127.0.0.1:1236".parse().unwrap());
+        let (conn_id1, _token1) = manager.register(1);
+        let (conn_id2, _token2) = manager.register(1);
+        let (conn_id3, _token3) = manager.register(2);
 
         assert_eq!(manager.connection_count(), 3);
         assert_eq!(manager.user_count(), 2);
@@ -169,7 +155,7 @@ mod tests {
     #[test]
     fn test_connection_manager_unregister() {
         let manager = ConnectionManager::new();
-        let (conn_id, _token) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
+        let (conn_id, _token) = manager.register(1);
         assert_eq!(manager.connection_count(), 1);
         assert_eq!(manager.user_count(), 1);
 
@@ -182,8 +168,8 @@ mod tests {
     #[test]
     fn test_connection_manager_unregister_partial() {
         let manager = ConnectionManager::new();
-        let (conn_id1, _token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
-        let (conn_id2, _token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
+        let (conn_id1, _token1) = manager.register(1);
+        let (conn_id2, _token2) = manager.register(1);
 
         assert_eq!(manager.connection_count(), 2);
         assert_eq!(manager.user_count(), 1);
@@ -202,9 +188,9 @@ mod tests {
     #[test]
     fn test_connection_manager_kick_user() {
         let manager = ConnectionManager::new();
-        let (_, token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
-        let (_, token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
-        let (_, token3) = manager.register(2, "127.0.0.1:1236".parse().unwrap());
+        let (_, token1) = manager.register(1);
+        let (_, token2) = manager.register(1);
+        let (_, token3) = manager.register(2);
 
         assert!(!token1.is_cancelled());
         assert!(!token2.is_cancelled());
@@ -228,11 +214,8 @@ mod tests {
             .map(|i| {
                 let m = manager_clone.clone();
                 thread::spawn(move || {
-                    for j in 0..100 {
-                        let (conn_id, _) = m.register(
-                            i % 3,
-                            SocketAddr::from(([127, 0, 0, 1], (i * 1000 + j) as u16)),
-                        );
+                    for _ in 0..100 {
+                        let (conn_id, _) = m.register(i % 3);
                         std::thread::sleep(std::time::Duration::from_micros(10));
                         m.unregister(conn_id);
                     }
@@ -252,19 +235,32 @@ mod tests {
 
     /// Test that unregister of the last connection for a user does NOT
     /// delete a new connection registered by another thread in between.
+    ///
+    /// Race scenario (same user_id):
+    ///   Thread A: unregister(conn1) -> retain removes conn1, vec is empty
+    ///            -> drop(guard) releases DashMap lock
+    ///            ---- window ----
+    ///   Thread B: register(user, conn2) -> pushes conn2 into vec
+    ///            ---- window ----
+    ///   Thread A: user_connections.remove(user_id) -> deletes vec containing conn2!
+    ///
+    /// After this, conn2 exists in `connections` but NOT in `user_connections`,
+    /// so kick_user will miss it, and user_count is wrong.
     #[test]
     fn test_unregister_register_race_same_user() {
         use std::sync::Barrier;
         use std::thread;
 
+        // Run many iterations to increase chance of hitting the race window
         for _ in 0..200 {
             let manager = ConnectionManager::new();
             let user_id: UserId = 42;
 
-            let (conn_id1, _token1) = manager.register(user_id, "127.0.0.1:1000".parse().unwrap());
+            let (conn_id1, _token1) = manager.register(user_id);
 
             let barrier = Arc::new(Barrier::new(2));
 
+            // Thread A: unregister conn1 (the last conn for this user)
             let m_a = manager.clone();
             let b_a = Arc::clone(&barrier);
             let handle_a = thread::spawn(move || {
@@ -272,25 +268,31 @@ mod tests {
                 m_a.unregister(conn_id1);
             });
 
+            // Thread B: register a new conn for the same user
             let m_b = manager.clone();
             let b_b = Arc::clone(&barrier);
             let handle_b = thread::spawn(move || {
                 b_b.wait();
-                m_b.register(user_id, "127.0.0.1:2000".parse().unwrap())
+                m_b.register(user_id)
             });
 
             handle_a.join().unwrap();
             let (conn_id2, _token2) = handle_b.join().unwrap();
 
+            // conn1 should be gone
             assert!(
                 manager.connections.get(&conn_id1).is_none(),
                 "conn1 should have been removed from connections"
             );
+
+            // conn2 must still exist in connections
             assert!(
                 manager.connections.get(&conn_id2).is_some(),
                 "conn2 must exist in connections map"
             );
 
+            // CRITICAL: conn2 must also be tracked in user_connections
+            // If the race occurred, user_connections.remove() deleted conn2's entry
             let has_user_entry = manager.user_connections.get(&user_id).is_some();
             let user_conn_contains_conn2 = manager
                 .user_connections
@@ -309,6 +311,7 @@ mod tests {
                 conn_id2, user_id
             );
 
+            // Clean up
             manager.unregister(conn_id2);
             assert_eq!(manager.connection_count(), 0);
             assert_eq!(manager.user_count(), 0);
@@ -318,9 +321,9 @@ mod tests {
     #[test]
     fn test_connection_manager_cancel_all() {
         let manager = ConnectionManager::new();
-        let (_, token1) = manager.register(1, "127.0.0.1:1234".parse().unwrap());
-        let (_, token2) = manager.register(1, "127.0.0.1:1235".parse().unwrap());
-        let (_, token3) = manager.register(2, "127.0.0.1:1236".parse().unwrap());
+        let (_, token1) = manager.register(1);
+        let (_, token2) = manager.register(1);
+        let (_, token3) = manager.register(2);
 
         assert!(!token1.is_cancelled());
         assert!(!token2.is_cancelled());
@@ -348,10 +351,7 @@ mod tests {
         //   wait on cancel_token → stream shutdown → scopeguard unregister
         for i in 0..100i64 {
             let m = manager.clone();
-            let (conn_id, cancel_token) = manager.register(
-                i % 10,
-                SocketAddr::from(([127, 0, 0, 1], (1000 + i) as u16)),
-            );
+            let (conn_id, cancel_token) = manager.register(i % 10);
             tokio::spawn(async move {
                 // Relay phase: blocked until cancelled
                 cancel_token.cancelled().await;
@@ -395,7 +395,7 @@ mod tests {
     }
 
     /// Test that high-contention concurrent register/unregister for the SAME user
-    /// always leaves consistent state.
+    /// always leaves consistent state: connection_count == 0, user_count == 0.
     #[test]
     fn test_concurrent_same_user_consistency() {
         use std::thread;
@@ -405,14 +405,11 @@ mod tests {
             let user_id: UserId = 1;
 
             let handles: Vec<_> = (0..20)
-                .map(|j| {
+                .map(|_| {
                     let m = manager.clone();
                     thread::spawn(move || {
-                        for k in 0..100 {
-                            let (conn_id, _) = m.register(
-                                user_id,
-                                SocketAddr::from(([127, 0, 0, 1], (j * 1000 + k) as u16)),
-                            );
+                        for _ in 0..100 {
+                            let (conn_id, _) = m.register(user_id);
                             std::thread::yield_now();
                             m.unregister(conn_id);
                         }
@@ -429,6 +426,7 @@ mod tests {
                 0,
                 "all connections must be cleaned up"
             );
+            // This is the key assertion: user_connections must also be fully cleaned
             assert_eq!(
                 manager.user_count(),
                 0,

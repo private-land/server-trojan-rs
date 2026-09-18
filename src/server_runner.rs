@@ -12,8 +12,52 @@ use crate::transport::{ConnectionMeta, TransportStream, TransportType};
 use dns_cache_rs::DnsCache;
 
 use anyhow::{anyhow, Result};
-use socket2::{SockRef, TcpKeepalive};
 use std::sync::Arc;
+
+/// ALPN protocols to advertise for a transport when TLS is enabled.
+pub fn alpn_for_transport(transport_type: TransportType) -> &'static [&'static [u8]] {
+    match transport_type {
+        TransportType::Grpc => &[b"h2"],
+        TransportType::WebSocket => &[b"http/1.1"],
+        TransportType::Tcp => &[],
+    }
+}
+
+/// Load the TLS server config for `config`, or `None` when TLS is disabled.
+/// Called from `main` before node registration so a bad PEM fails fast.
+pub fn load_tls(config: &config::ServerConfig) -> Result<Option<Arc<rustls::ServerConfig>>> {
+    use crate::transport::TlsTransportListener;
+    let (transport_type, has_tls) = build_transport_config(config);
+    if !has_tls {
+        return Ok(None);
+    }
+    let tls_config = TlsTransportListener::load_tls_config(
+        config.cert.as_ref().unwrap(),
+        config.key.as_ref().unwrap(),
+        alpn_for_transport(transport_type),
+    )?;
+    Ok(Some(tls_config))
+}
+
+/// Inbound WebSocket frames are sized by the client's Trojan writer (Xray:
+/// ≤ 8 KiB + AEAD overhead per message), not by our relay buffer, so the
+/// accept limits have a floor independent of `--buffer_size`.
+const WS_MIN_MAX_FRAME: usize = 64 * 1024;
+const WS_MIN_MAX_MESSAGE: usize = 256 * 1024;
+
+/// tungstenite limits: write buffers follow the relay buffer size (bounded
+/// per connection, default max is usize::MAX); read limits are bounded but
+/// never below what a compliant client sends.
+pub fn ws_config_for(buf_size: usize) -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let max_frame = (buf_size * 2).max(WS_MIN_MAX_FRAME);
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .write_buffer_size(buf_size)
+        // tungstenite requires write_buffer_size + one full message, else
+        // start_send fails with WriteBufferFull once the relay is backed up.
+        .max_write_buffer_size(buf_size + max_frame + 16)
+        .max_message_size(Some((buf_size * 4).max(WS_MIN_MAX_MESSAGE)))
+        .max_frame_size(Some(max_frame))
+}
 
 /// Build transport configuration from server config
 pub fn build_transport_config(config: &config::ServerConfig) -> (TransportType, bool) {
@@ -38,19 +82,8 @@ pub async fn build_router(
 ) -> Result<Arc<dyn hooks::OutboundRouter>> {
     use crate::acl::AclRouter;
 
+    // Existence and .yaml/.yml extension were already checked by CliArgs::validate.
     if let Some(ref acl_path) = config.acl_conf_file {
-        if !acl_path.exists() {
-            return Err(anyhow!("ACL config file not found: {}", acl_path.display()));
-        }
-
-        // Validate file extension
-        let ext = acl_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml") {
-            return Err(anyhow!(
-                "Invalid ACL config file format: expected .yaml or .yml"
-            ));
-        }
-
         let acl_config = acl::load_acl_config(acl_path).await?;
         let engine =
             acl::AclEngine::new(acl_config, Some(config.data_dir.as_path()), refresh_geodata)
@@ -90,10 +123,6 @@ pub struct NetworkSettings {
     pub ws_path: String,
 }
 
-/// TCP keepalive interval — matches Go's net.ListenConfig default (15s).
-/// Dead peers are detected in ~45s (3 probes × 15s).
-const TCP_KEEPALIVE_SECS: u64 = 15;
-
 /// Accept and handle a connection with proper transport wrapping
 pub async fn accept_connection<S>(
     server: Arc<Server>,
@@ -101,25 +130,52 @@ pub async fn accept_connection<S>(
     peer_addr: std::net::SocketAddr,
     transport_type: TransportType,
     network_settings: Arc<NetworkSettings>,
+    conn_limiter: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    use crate::transport::{GrpcConnection, WebSocketTransport};
+    use crate::transport::GrpcConnection;
 
     match transport_type {
         TransportType::Grpc => {
             log::debug!(peer = %peer_addr, "gRPC connection established, waiting for streams");
-            let grpc_conn = GrpcConnection::with_config(
-                stream,
-                &network_settings.grpc_service_name,
-                server.conn_config.buffer_size,
+            // Bound the HTTP/2 preface/SETTINGS exchange like the WS and TLS
+            // handshakes: a silent peer must not hold a connection permit forever.
+            let grpc_conn = tokio::time::timeout(
+                server.conn_config.request_timeout,
+                GrpcConnection::with_config(
+                    stream,
+                    &network_settings.grpc_service_name,
+                    server.conn_config.buffer_size,
+                    server.conn_config.idle_timeout,
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| {
+                log::debug!(peer = %peer_addr, stage = "h2_timeout", "Connection failed");
+                anyhow!("HTTP/2 handshake timeout")
+            })??;
             let result = grpc_conn
                 .run(move |grpc_transport| {
                     let server = Arc::clone(&server);
+                    let limiter = conn_limiter.clone();
                     async move {
+                        // One H2 connection multiplexes up to 100 Trojan sessions;
+                        // each one is a relay with its own outbound socket and
+                        // buffers, so each takes a max_connections permit (the
+                        // connection itself already holds one). At capacity the
+                        // stream is refused instead of stalling the whole H2 link.
+                        let _stream_permit = match limiter {
+                            Some(l) => match l.try_acquire_owned() {
+                                Ok(p) => Some(p),
+                                Err(_) => {
+                                    log::debug!(peer = %peer_addr, "gRPC stream refused: max_connections reached");
+                                    return Err(anyhow!("max_connections reached"));
+                                }
+                            },
+                            None => None,
+                        };
                         let stream: TransportStream = Box::pin(grpc_transport);
                         let meta = ConnectionMeta {
                             peer_addr,
@@ -141,52 +197,23 @@ where
             result
         }
         TransportType::WebSocket => {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-
             // Limit tungstenite internal buffers to prevent unbounded memory growth.
             // At 50k connections, tungstenite's defaults (write_buffer_size=128KB,
             // max_write_buffer_size=usize::MAX) would allow tens of GB total.
             // Our WebSocketTransport layer handles backpressure via Poll::Pending,
             // but tungstenite's own buffers must also be bounded.
-            let buf_size = server.conn_config.buffer_size;
-            let ws_config = WebSocketConfig::default()
-                .write_buffer_size(buf_size) // matches relay buffer size
-                .max_write_buffer_size(buf_size * 2) // 2x buffer_size (default usize::MAX!)
-                .max_message_size(Some(buf_size * 4)) // 4x buffer_size = 128KB (default 64MB)
-                .max_frame_size(Some(buf_size * 2)); // 2x buffer_size (default 16MB)
+            let ws_config = ws_config_for(server.conn_config.buffer_size);
 
-            // WebSocket handshake with path validation and timeout.
-            // Capture Arc<NetworkSettings> in closure (atomic refcount increment)
-            // instead of cloning ws_path String (heap allocation).
-            let ns = Arc::clone(&network_settings);
-            let ws_stream = tokio::time::timeout(
+            // WebSocket handshake with path validation, early data and timeout.
+            let ws_transport = tokio::time::timeout(
                 server.conn_config.request_timeout,
-                tokio_tungstenite::accept_hdr_async_with_config(
-                    stream,
-                    #[allow(clippy::result_large_err)] // Err type fixed by tungstenite Callback trait
-                    move |req: &Request, response: Response| {
-                        let path = req.uri().path();
-                        // For "/" or empty path, accept any path (Xray behavior)
-                        if !ns.ws_path.is_empty() && ns.ws_path != "/" && path != ns.ws_path {
-                            log::debug!(path = %path, expected = %ns.ws_path, "WebSocket path mismatch");
-                            let reject = http::Response::builder()
-                                .status(http::StatusCode::NOT_FOUND)
-                                .body(None)
-                                .unwrap();
-                            return Err(reject);
-                        }
-                        Ok(response)
-                    },
-                    Some(ws_config),
-                ),
+                crate::transport::ws::accept(stream, &network_settings.ws_path, ws_config),
             )
             .await
             .map_err(|_| {
                 log::debug!(peer = %peer_addr, stage = "ws_timeout", "Connection failed");
                 anyhow!("WebSocket handshake timeout")
             })??;
-            let ws_transport = WebSocketTransport::new(ws_stream);
             let stream: TransportStream = Box::pin(ws_transport);
             let meta = ConnectionMeta {
                 peer_addr,
@@ -206,11 +233,18 @@ where
 }
 
 /// Run the server accept loop
-pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> Result<()> {
-    use crate::transport::TlsTransportListener;
+///
+/// `tls` is the config produced by [`load_tls`] (validated in `main` before
+/// the node registers); `None` when the panel disabled TLS.
+pub async fn run_server(
+    server: Arc<Server>,
+    config: &config::ServerConfig,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
     use tokio::sync::Semaphore;
 
-    let (transport_type, has_tls) = build_transport_config(config);
+    let (transport_type, _) = build_transport_config(config);
+    let has_tls = tls.is_some();
 
     // Connection limiter: 0 = unlimited
     let conn_limiter = if server.conn_config.max_connections > 0 {
@@ -220,17 +254,9 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
     };
 
     // Build TLS acceptor if needed
-    let tls_acceptor = if has_tls {
-        let tls_config = TlsTransportListener::load_tls_config(
-            config.cert.as_ref().unwrap(),
-            config.key.as_ref().unwrap(),
-        )?;
-        Some(tokio_rustls::TlsAcceptor::from(tls_config))
-    } else {
-        None
-    };
+    let tls_acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
 
-    // Bind TCP listener with dual-stack (IPv4+IPv6) support
+    // Bind TCP listener with IPv4+IPv6 dual-stack support
     let listener = crate::net::bind_dual_stack(config.port, server.conn_config.tcp_backlog)?;
     let local_addr = listener.local_addr()?;
 
@@ -249,6 +275,25 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
         grpc_service = %network_settings.grpc_service_name,
         "Server started"
     );
+
+    // Housekeeping every 60 s: report DNS cache effectiveness.
+    {
+        let dns_cache = server.dns_cache.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // first tick fires immediately; nothing to do yet
+            loop {
+                tick.tick().await;
+                let dns = dns_cache.stats();
+                log::debug!(
+                    dns_hits = dns.hits,
+                    dns_misses = dns.misses,
+                    dns_negative_hits = dns.negative_hits,
+                    "Housekeeping"
+                );
+            }
+        });
+    }
 
     loop {
         match listener.accept().await {
@@ -270,6 +315,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                 };
 
                 let server = Arc::clone(&server);
+                let limiter = conn_limiter.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let network_settings = Arc::clone(&network_settings);
 
@@ -277,16 +323,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                     // Hold permit for the lifetime of this connection
                     let _permit = _permit;
                     let result = async {
-                        // Set TCP_NODELAY for lower latency
-                        if server.conn_config.tcp_nodelay {
-                            let _ = stream.set_nodelay(true);
-                        }
-
-                        // Enable TCP keepalive to detect dead peers (mobile disconnect, network change, etc.)
-                        let keepalive = TcpKeepalive::new()
-                            .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
-                            .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
-                        let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+                        crate::net::tune_tcp_stream(&stream, server.conn_config.tcp_nodelay);
 
                         if let Some(tls_acceptor) = tls_acceptor {
                             // TLS handshake with timeout
@@ -297,7 +334,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                             .await
                             {
                                 Ok(Ok(tls_stream)) => {
-                                    accept_connection(server, tls_stream, peer_addr, transport_type, network_settings).await
+                                    accept_connection(server, tls_stream, peer_addr, transport_type, network_settings, limiter).await
                                 }
                                 Ok(Err(e)) => {
                                     log::debug!(peer = %peer_addr, error = %e, stage = "tls", "Connection failed");
@@ -309,7 +346,7 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                                 }
                             }
                         } else {
-                            accept_connection(server, stream, peer_addr, transport_type, network_settings).await
+                            accept_connection(server, stream, peer_addr, transport_type, network_settings, limiter).await
                         }
                     }
                     .await;
@@ -317,14 +354,16 @@ pub async fn run_server(server: Arc<Server>, config: &config::ServerConfig) -> R
                     if let Err(e) = result {
                         log::debug!(peer = %peer_addr, error = %e, "Connection error");
                     }
+                    log::connection(peer_addr, "closed");
                 });
             }
             Err(e) => {
+                // EMFILE/ENFILE/ECONNABORTED are transient; back off so an
+                // exhausted fd table does not turn the accept loop into a
+                // busy loop (std never yields ErrorKind::Other for OS errors,
+                // so there is no reliable "fatal" kind to break on).
                 log::error!(error = %e, "Failed to accept connection");
-                // Continue accepting unless it's a fatal error
-                if e.kind() == std::io::ErrorKind::Other {
-                    break;
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
@@ -339,17 +378,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_limiter_backpressure() {
+        // Simulate max_connections = 2
         let limiter = Arc::new(Semaphore::new(2));
 
+        // Acquire 2 permits (simulates 2 active connections)
         let permit1 = limiter.clone().acquire_owned().await.unwrap();
         let permit2 = limiter.clone().acquire_owned().await.unwrap();
         assert_eq!(limiter.available_permits(), 0);
 
+        // 3rd acquire should block — verify with try_acquire
         assert!(limiter.try_acquire().is_err());
 
+        // Drop one permit (connection closes) -> slot freed
         drop(permit1);
         assert_eq!(limiter.available_permits(), 1);
 
+        // Now a new connection can acquire
         let _permit3 = limiter.clone().acquire_owned().await.unwrap();
         assert_eq!(limiter.available_permits(), 0);
 
@@ -360,6 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_limiter_unlimited_when_none() {
+        // max_connections = 0 -> conn_limiter is None -> no limit
         let max_connections: usize = 0;
         let conn_limiter: Option<Arc<Semaphore>> = if max_connections > 0 {
             Some(Arc::new(Semaphore::new(max_connections)))
@@ -375,43 +420,52 @@ mod tests {
         let limiter = Arc::new(Semaphore::new(1));
         let limiter_clone = limiter.clone();
 
+        // Simulate: acquire in accept loop, move into spawned task
         let handle = tokio::spawn(async move {
             let _permit = limiter_clone.acquire_owned().await.unwrap();
+            // Simulate connection work
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // _permit dropped here when task ends
         });
 
+        // Give the task time to acquire
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert_eq!(limiter.available_permits(), 0);
 
+        // Wait for task to finish
         handle.await.unwrap();
         assert_eq!(limiter.available_permits(), 1);
     }
 
     #[test]
     fn test_ws_config_buffer_limits() {
-        use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-
         let buf_size: usize = 32 * 1024;
-        let ws_config = WebSocketConfig::default()
-            .write_buffer_size(buf_size)
-            .max_write_buffer_size(buf_size * 2)
-            .max_message_size(Some(buf_size * 4))
-            .max_frame_size(Some(buf_size * 2));
+        let ws_config = super::ws_config_for(buf_size);
 
         // Write buffer matches configured buffer_size
         assert_eq!(ws_config.write_buffer_size, buf_size);
-        // Max write buffer is 2x buffer_size and bounded (not usize::MAX)
-        assert_eq!(ws_config.max_write_buffer_size, buf_size * 2);
+        // Max write buffer holds the write buffer plus one full frame and is bounded
+        assert_eq!(
+            ws_config.max_write_buffer_size,
+            buf_size + buf_size * 2 + 16
+        );
         assert!(ws_config.max_write_buffer_size < usize::MAX);
 
         // Message and frame sizes are bounded
-        assert_eq!(ws_config.max_message_size, Some(buf_size * 4));
+        assert_eq!(ws_config.max_message_size, Some(super::WS_MIN_MAX_MESSAGE));
         assert_eq!(ws_config.max_frame_size, Some(buf_size * 2));
+
+        // a small relay buffer must not shrink inbound limits below what
+        // a Trojan client sends per WebSocket message
+        let small = super::ws_config_for(4096);
+        assert_eq!(small.max_frame_size, Some(super::WS_MIN_MAX_FRAME));
+        assert_eq!(small.max_message_size, Some(super::WS_MIN_MAX_MESSAGE));
+        assert!(small.max_write_buffer_size >= small.write_buffer_size + super::WS_MIN_MAX_FRAME);
     }
 
     #[test]
     fn test_tcp_keepalive_interval() {
-        use super::TCP_KEEPALIVE_SECS;
+        use crate::net::TCP_KEEPALIVE_SECS;
         // Match Go net.ListenConfig default: 15s keepalive
         assert_eq!(TCP_KEEPALIVE_SECS, 15);
         // 3 probes × 15s interval = ~45s detection time
@@ -430,32 +484,6 @@ mod tests {
         // this is the root cause we're protecting against.
         let defaults = WebSocketConfig::default();
         assert_eq!(defaults.max_write_buffer_size, usize::MAX);
-    }
-
-    /// Verify WS path validation logic: non-empty, non-"/" path should reject mismatch
-    #[test]
-    fn test_ws_path_validation_logic() {
-        // Simulates the condition used in accept_connection
-        let check_path = |ws_path: &str, request_path: &str| -> bool {
-            // Returns true if connection should be REJECTED
-            !ws_path.is_empty() && ws_path != "/" && request_path != ws_path
-        };
-
-        // Configured path "/secret", request path matches → accept
-        assert!(!check_path("/secret", "/secret"));
-
-        // Configured path "/secret", request path differs → reject
-        assert!(check_path("/secret", "/other"));
-        assert!(check_path("/secret", "/"));
-        assert!(check_path("/secret", ""));
-
-        // Configured path is "/" → accept all (Xray behavior)
-        assert!(!check_path("/", "/anything"));
-        assert!(!check_path("/", "/"));
-
-        // Configured path is empty → accept all (Xray behavior)
-        assert!(!check_path("", "/anything"));
-        assert!(!check_path("", ""));
     }
 
     /// Arc<NetworkSettings> clone is an atomic refcount increment (no heap allocation),

@@ -40,35 +40,6 @@ impl LogLevel {
     }
 }
 
-#[allow(dead_code)]
-fn get_log_level_from_args() -> Option<LogLevel> {
-    let args: Vec<String> = std::env::args().collect();
-
-    let log_level_from_cli = args
-        .iter()
-        .position(|a| a == "--log-level")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| LogLevel::from_str(s).ok());
-
-    if log_level_from_cli.is_some() {
-        return log_level_from_cli;
-    }
-
-    args.iter()
-        .position(|a| a == "--config-file" || a == "-c")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|config_path| {
-            std::fs::read_to_string(config_path)
-                .ok()
-                .and_then(|content| {
-                    toml::from_str::<toml::Value>(&content)
-                        .ok()
-                        .and_then(|v| v.get("log")?.get("level")?.as_str().map(|s| s.to_string()))
-                        .and_then(|s| LogLevel::from_str(&s).ok())
-                })
-        })
-}
-
 /// Time format for log timestamps
 const LOG_TIME_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second]"
@@ -78,12 +49,19 @@ const LOG_TIME_FORMAT: &[time::format_description::FormatItem<'static>] = time::
 pub fn init_logger(log_level_str: &str) {
     let level = LogLevel::from_str(log_level_str).unwrap_or_default();
 
+    // Our own modules get exactly the requested level. Dependencies get the
+    // requested level when it is *quieter* than INFO (so --log_mode warn is
+    // actually quiet) but never chattier than INFO (debug/trace from h2,
+    // rustls, hyper would drown our own debug output).
+    let own = level.to_level_filter();
+    let deps = if own < LevelFilter::INFO {
+        own
+    } else {
+        LevelFilter::INFO
+    };
     let filter = tracing_subscriber::filter::Targets::new()
-        .with_targets(vec![
-            ("server_trojan_r", level.to_level_filter()),
-            ("server", level.to_level_filter()),
-        ])
-        .with_default(LevelFilter::INFO);
+        .with_target(env!("CARGO_CRATE_NAME"), own)
+        .with_default(deps);
 
     let registry = tracing_subscriber::registry();
     registry
@@ -112,36 +90,23 @@ pub mod log {
             debug!(peer = %addr, "Authentication failed");
         }
     }
-
-    /// Log transport layer events
-    #[allow(dead_code)]
-    pub fn transport(transport: &str, event: &str, details: Option<&str>) {
-        if let Some(details) = details {
-            info!(
-                transport = transport,
-                event = event,
-                details = details,
-                "Transport"
-            );
-        } else {
-            info!(transport = transport, event = event, "Transport");
-        }
-    }
-
-    /// Log protocol parsing events
-    #[allow(dead_code)]
-    pub fn protocol(event: &str, error: Option<&str>) {
-        if let Some(err) = error {
-            warn!(event = event, error = err, "Protocol");
-        } else {
-            debug!(event = event, "Protocol");
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LevelFilter ordering: more verbose is greater; the dependency default
+    /// must follow a quiet request (warn/error) and cap at INFO otherwise.
+    #[test]
+    fn dependency_level_follows_quiet_requests_and_caps_at_info() {
+        assert!(LevelFilter::WARN < LevelFilter::INFO);
+        assert!(LevelFilter::DEBUG > LevelFilter::INFO);
+        assert_eq!(
+            env!("CARGO_CRATE_NAME"),
+            module_path!().split("::").next().unwrap()
+        );
+    }
 
     #[test]
     fn test_log_level_from_str_valid() {
