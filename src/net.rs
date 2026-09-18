@@ -58,6 +58,24 @@ fn is_ipv6_unsupported(err: &anyhow::Error) -> bool {
     }
 }
 
+/// TCP keepalive interval — matches Go's net.ListenConfig default (15s).
+/// Dead peers are detected in ~45s (3 probes × 15s).
+pub const TCP_KEEPALIVE_SECS: u64 = 15;
+
+/// Apply the per-socket tuning used for every TCP stream we own (inbound
+/// accepts and direct outbound connects): optional TCP_NODELAY plus keepalive
+/// so dead peers (mobile disconnect, network change) are detected.
+pub fn tune_tcp_stream(stream: &tokio::net::TcpStream, nodelay: bool) {
+    use socket2::{SockRef, TcpKeepalive};
+    if nodelay {
+        let _ = stream.set_nodelay(true);
+    }
+    let keepalive = TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+        .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
+    let _ = SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

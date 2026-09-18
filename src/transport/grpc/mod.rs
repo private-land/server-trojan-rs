@@ -1,6 +1,6 @@
 //! gRPC transport module
 //!
-//! Provides gRPC (HTTP/2) transport for Trojan protocol,
+//! Provides gRPC (HTTP/2) transport for VMess protocol,
 //! compatible with v2ray's gRPC transport.
 
 mod codec;

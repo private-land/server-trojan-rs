@@ -107,7 +107,14 @@ pub struct CliArgs {
     pub acl_conf_file: Option<PathBuf>,
 
     /// Block connections to private/loopback IP addresses (SSRF protection)
-    #[arg(long, env = "X_PANDA_TROJAN_BLOCK_PRIVATE_IP", default_value_t = true)]
+    #[arg(
+        long,
+        env = "X_PANDA_TROJAN_BLOCK_PRIVATE_IP",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     pub block_private_ip: bool,
 
     // ==================== Performance Tuning ====================
@@ -145,6 +152,9 @@ pub struct CliArgs {
         long,
         env = "X_PANDA_TROJAN_TCP_NODELAY",
         default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
         help_heading = "Performance"
     )]
     pub tcp_nodelay: bool,
@@ -237,6 +247,76 @@ impl CliArgs {
         if self.heartbeat_interval.is_zero() {
             return Err(anyhow!("heartbeat_interval must be greater than 0"));
         }
+        // A zero relay buffer makes every read return 0 bytes ("EOF"), so
+        // every session would "complete" instantly with no data.
+        if self.buffer_size == 0 {
+            return Err(anyhow!("buffer_size must be greater than 0"));
+        }
+        // Two relay buffers per session are allocated at this size, and it is
+        // also the gRPC message size (grpc-go clients refuse above 4 MiB).
+        if self.buffer_size > MAX_BUFFER_SIZE {
+            return Err(anyhow!("buffer_size must be at most {MAX_BUFFER_SIZE}"));
+        }
+        if self.log_mode.parse::<crate::logger::LogLevel>().is_err() {
+            return Err(anyhow!(
+                "Invalid log_mode '{}'. Use trace, debug, info, warn or error",
+                self.log_mode
+            ));
+        }
+        for (name, d) in [
+            ("tcp_connect_timeout", self.tcp_connect_timeout),
+            ("request_timeout", self.request_timeout),
+            ("tls_handshake_timeout", self.tls_handshake_timeout),
+        ] {
+            if d.is_zero() {
+                return Err(anyhow!("{name} must be greater than 0"));
+            }
+        }
+        if self.tcp_backlog <= 0 {
+            return Err(anyhow!("tcp_backlog must be greater than 0"));
+        }
+        if let MaxConnections::Fixed(n) = self.max_connections {
+            if n > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(anyhow!(
+                    "max_connections must be at most {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ));
+            }
+        }
+        // These are consumed with whole-second resolution (`as_secs`); a
+        // sub-second value would silently become 0 and end every session.
+        for (name, d) in [
+            ("conn_idle_timeout", self.conn_idle_timeout),
+            ("uplink_only_timeout", self.uplink_only_timeout),
+            ("downlink_only_timeout", self.downlink_only_timeout),
+            ("api_timeout", self.api_timeout),
+        ] {
+            if d < Duration::from_secs(1) {
+                return Err(anyhow!("{name} must be at least 1s"));
+            }
+        }
+        // Timer deadlines are `Instant::now() + timeout`; an absurd value
+        // (humantime accepts "300y") would overflow and abort the process on
+        // the first relayed byte.
+        for (name, d) in [
+            ("conn_idle_timeout", self.conn_idle_timeout),
+            ("uplink_only_timeout", self.uplink_only_timeout),
+            ("downlink_only_timeout", self.downlink_only_timeout),
+            ("api_timeout", self.api_timeout),
+            ("tcp_connect_timeout", self.tcp_connect_timeout),
+            ("request_timeout", self.request_timeout),
+            ("tls_handshake_timeout", self.tls_handshake_timeout),
+            ("fetch_users_interval", self.fetch_users_interval),
+            ("report_traffics_interval", self.report_traffics_interval),
+            ("heartbeat_interval", self.heartbeat_interval),
+        ] {
+            if d > MAX_DURATION {
+                return Err(anyhow!(
+                    "{name} must be at most {}",
+                    humantime::format_duration(MAX_DURATION)
+                ));
+            }
+        }
 
         // Validate acl_conf_file if provided
         if let Some(ref path) = self.acl_conf_file {
@@ -255,15 +335,25 @@ impl CliArgs {
     }
 }
 
+/// Upper bound for `buffer_size` (4 MiB): two relay buffers per session are
+/// allocated at this size, and it is also the gRPC message size, which
+/// grpc-go clients (Xray) refuse above their 4 MiB default.
+const MAX_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// Upper bound for every configurable duration (30 days).
+const MAX_DURATION: Duration = Duration::from_secs(30 * 24 * 3600);
+
 /// Trojan node configuration deserialized from panel JSON
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrojanConfig {
     pub server_port: u16,
     #[serde(default)]
     pub network: Option<String>,
-    #[serde(default)]
+    /// v2board emits `{network}_settings` (`ws_settings`); the panel client
+    /// normalises it, the alias keeps raw panel JSON working too.
+    #[serde(default, alias = "ws_settings")]
     pub websocket_config: Option<WebSocketConfig>,
-    #[serde(default)]
+    #[serde(default, alias = "grpc_settings")]
     pub grpc_config: Option<GrpcConfig>,
 }
 
@@ -280,8 +370,24 @@ pub struct WebSocketConfig {
 /// gRPC transport configuration from panel
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrpcConfig {
-    #[serde(default)]
+    #[serde(default, alias = "serviceName")]
     pub service_name: Option<String>,
+}
+
+/// Normalize a panel-supplied WebSocket path the way Xray does on both ends:
+/// strip any query (`?ed=2048` early-data hint), ensure a leading `/`.
+/// The admin UI passes the value through unchanged, so `"trojan"` and
+/// `"/trojan?ed=2048"` must both match a client requesting `GET /trojan`.
+pub fn normalize_ws_path(raw: &str) -> String {
+    let path = raw.trim().split('?').next().unwrap_or("").trim();
+    if path.is_empty() {
+        return String::new();
+    }
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
 }
 
 /// Parse NodeConfigEnum into TrojanConfig
@@ -406,7 +512,9 @@ impl ServerConfig {
         let ws_path = remote
             .websocket_config
             .as_ref()
-            .and_then(|c| c.path.clone())
+            .and_then(|c| c.path.as_deref())
+            .map(normalize_ws_path)
+            .filter(|p| !p.is_empty())
             .unwrap_or_else(|| DEFAULT_WS_PATH.to_string());
 
         // Extract gRPC service name from remote config (Xray default: "GunService")
@@ -433,17 +541,28 @@ impl ServerConfig {
             block_private_ip: cli.block_private_ip,
         })
     }
-
-    /// Get the expected gRPC path (format: "/${service_name}/Tun")
-    #[allow(dead_code)]
-    pub fn grpc_path(&self) -> String {
-        format!("/{}/Tun", self.grpc_service_name)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ws_path_is_normalized_like_xray() {
+        assert_eq!(normalize_ws_path("trojan"), "/trojan");
+        assert_eq!(normalize_ws_path("/trojan?ed=2048"), "/trojan");
+        assert_eq!(normalize_ws_path(" /a "), "/a");
+        assert_eq!(normalize_ws_path(""), "");
+        assert_eq!(normalize_ws_path("?ed=1"), "");
+    }
+
+    #[test]
+    fn panel_aliases_are_accepted() {
+        let json = r#"{"server_port":443,"network":"grpc","grpc_settings":{"serviceName":"svc"},"ws_settings":{"path":"p"}}"#;
+        let c: TrojanConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.grpc_config.unwrap().service_name.as_deref(), Some("svc"));
+        assert_eq!(c.websocket_config.unwrap().path.as_deref(), Some("p"));
+    }
 
     fn create_test_cli_args() -> CliArgs {
         CliArgs {
@@ -775,7 +894,6 @@ mod tests {
 
         assert_eq!(config.grpc_service_name, DEFAULT_GRPC_SERVICE_NAME);
         assert_eq!(config.grpc_service_name, "GunService");
-        assert_eq!(config.grpc_path(), "/GunService/Tun");
     }
 
     #[test]
@@ -793,7 +911,6 @@ mod tests {
         let config = ServerConfig::from_remote(&remote, &cli).unwrap();
 
         assert_eq!(config.grpc_service_name, "MyCustomService");
-        assert_eq!(config.grpc_path(), "/MyCustomService/Tun");
     }
 
     #[test]
